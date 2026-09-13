@@ -833,8 +833,20 @@ begin
   // last parameter: close the call right away (decided again NOW - the
   // text after the caret may have changed since the list was built)
   var Closing := '';
+  var Consume := 0;
   if AOffer.CloseCall then
-    Closing := CallClosingText(Lines, Line - 1, Col - 1, Ctx);
+    Closing := CallClosingText(Lines, Line - 1, Col - 1, Ctx, Consume);
+
+  if AOffer.Anonymous and (Ctx.Site = gsArgument) then
+  begin
+    // an ARGUMENT gets its own lines, one level below the call (user
+    // request), whether the caret is on the call's line or on the next
+    var SC0, BL0, BC: Integer;
+    Text := AnonymousArgumentText(Lines, Line - 1, Ctx, AOffer.Info, SC0, BL0, BC);
+    if Editor.ReplaceSelection(F, Line, SC0 + 1, Line, EndCol + Consume, Text + Closing) then
+      Editor.GotoLocation(F, BL0, BC);
+    Exit;
+  end;
 
   if AOffer.Anonymous then
   begin
@@ -877,7 +889,7 @@ begin
     ShowThemedMessage('The implementation could not be inserted.');
     Exit;
   end;
-  Editor.ReplaceSelection(F, Line, StartCol, Line, EndCol, Pad + Name + Closing);
+  Editor.ReplaceSelection(F, Line, StartCol, Line, EndCol + Consume, Pad + Name + Closing);
   Editor.InsertTextAtLineStart(F, Plan.DeclLine0 + 1, Plan.DeclText);
   Editor.GotoLocation(F, Plan.ImplBodyLine0 + Plan.DeclLines, 2);
 end;

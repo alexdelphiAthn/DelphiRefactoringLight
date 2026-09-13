@@ -160,11 +160,25 @@ function AnonymousMethodText(const AInfo: TProcTypeInfo; const AIndent: string;
 /// <summary>What closes the call when the generated argument is its LAST
 ///  parameter: ');' for a call that is a statement of its own
 ///  ("TThread.CreateAnonymousThread(|"), ')' when the call itself sits
-///  inside another open bracket ("Foo(Bar(|"), '' when anything already
-///  follows the caret on the line or the call position is unknown.
-///  ACol0 = caret column (0-based, may lie beyond the line end).</summary>
+///  inside another open bracket ("Foo(Bar(|") or an 'else' follows.
+///  A ')' that is ALREADY there (the IDE closes brackets automatically) is
+///  consumed and written again with ';': AConsume = characters after the
+///  caret the edit replaces. '' when anything else follows the caret or
+///  the call position is unknown. ACol0 = caret column (0-based, may lie
+///  beyond the line end).</summary>
 function CallClosingText(const ALines: TArray<string>; ALine0, ACol0: Integer;
-  const ACtx: TGenContext): string;
+  const ACtx: TGenContext; out AConsume: Integer): string;
+
+/// <summary>An anonymous method as a call ARGUMENT, laid out on its own
+///  lines: header, begin and end one level deeper than the call's line,
+///  the body one more. On the call's line the text starts with a line
+///  break (trailing blanks before the caret are dropped); on an otherwise
+///  empty continuation line that line is replaced. AStartCol0 = 0-based
+///  column the replacement starts at (it ends at the caret), ABodyLine0 /
+///  ABodyCol = caret position inside the new body.</summary>
+function AnonymousArgumentText(const ALines: TArray<string>; ALine0: Integer;
+  const ACtx: TGenContext; const AInfo: TProcTypeInfo;
+  out AStartCol0, ABodyLine0, ABodyCol: Integer): string;
 
 /// <summary>Handler name after the IDE's convention: Button1.OnClick ->
 ///  Button1Click; FTimer.OnTimer -> TimerTimer; bare FOnChange -> DoChange;
@@ -984,37 +998,64 @@ begin
 end;
 
 function CallClosingText(const ALines: TArray<string>; ALine0, ACol0: Integer;
-  const ACtx: TGenContext): string;
+  const ACtx: TGenContext; out AConsume: Integer): string;
 var
-  L, I, Depth, Budget: Integer;
-  S: string;
+  L, I, Depth, Budget, P: Integer;
+  S, Rest: string;
+  HasCloser, Nested: Boolean;
+
+  function FollowedByElse(AFrom: Integer): Boolean;
+  begin
+    Result := False;
+    for var K := AFrom to High(ALines) do
+    begin
+      var U := UpperCase(Trim(ALines[K]));
+      if U = '' then Continue;
+      Exit(U.StartsWith('ELSE') and ((Length(U) = 4) or not IsIdentChar(U[5])));
+    end;
+  end;
+
 begin
   Result := '';
+  AConsume := 0;
   if (ACtx.Site <> gsArgument) or (ACtx.CallLine < 0) then Exit;
   if (ALine0 < 0) or (ALine0 > High(ALines)) or (ACtx.CallLine > High(ALines)) then Exit;
-  // something (a closing bracket, further arguments) already follows
-  if Trim(Copy(ALines[ALine0], ACol0 + 1, MaxInt)) <> '' then Exit;
-  Result := ');';
+  // What follows the caret: nothing, or exactly the closing bracket the
+  // IDE inserted on its own - anything else (more arguments, ");",
+  // ".Start;", ") else") means there is nothing to add.
+  Rest := Copy(ALines[ALine0], ACol0 + 1, MaxInt);
+  P := 1;
+  while (P <= Length(Rest)) and CharInSet(Rest[P], [' ', #9]) do Inc(P);
+  HasCloser := False;
+  if P <= Length(Rest) then
+  begin
+    if Rest[P] <> ')' then Exit;
+    if Trim(Copy(Rest, P + 1, MaxInt)) <> '' then Exit;
+    HasCloser := True;
+  end;
+
   // Is the CALL itself nested in an unclosed ( or [ ? Walk back from the
   // call name to the start of the statement.
+  Nested := False;
   Depth := 0;
   Budget := 0;
   L := ACtx.CallLine;
   I := ACtx.CallCol;
-  while (L >= 0) and (Budget < 20) do
+  while (L >= 0) and (Budget < 20) and not Nested do
   begin
     S := ALines[L];
     var C := Pos('//', S);
     if C > 0 then S := Copy(S, 1, C - 1);
     if L <> ACtx.CallLine then I := Length(S);
     if I > Length(S) then I := Length(S);
-    while I >= 1 do
+    var StatementStart := False;
+    while (I >= 1) and not Nested and not StatementStart do
     begin
       case S[I] of
         ')', ']': Inc(Depth);
         '(', '[':
-          if Depth = 0 then Exit(')') else Dec(Depth);
-        ';': if Depth = 0 then Exit;
+          if Depth = 0 then Nested := True else Dec(Depth);
+        ';': if Depth = 0 then StatementStart := True;
         '''':
           begin
             Dec(I);
@@ -1023,12 +1064,67 @@ begin
       end;
       Dec(I);
     end;
+    if StatementStart then Break;
     // a block opener ends the statement search as well
     var U := UpperCase(Trim(S));
     if (U = 'BEGIN') or U.EndsWith(' BEGIN') or (U = 'TRY') or U.EndsWith(' THEN')
-      or U.EndsWith(' DO') or (U = 'ELSE') or U.EndsWith(' ELSE') then Exit;
+      or U.EndsWith(' DO') or (U = 'ELSE') or U.EndsWith(' ELSE') then Break;
     Dec(L);
     Inc(Budget);
+  end;
+
+  if Nested then
+  begin
+    // the enclosing expression goes on - an existing bracket stays as is
+    if not HasCloser then Result := ')';
+    Exit;
+  end;
+  Result := ')';
+  if HasCloser then AConsume := P;
+  // "if A then Run(...)" + "else": a ';' there would not compile
+  if not FollowedByElse(ALine0 + 1) then Result := Result + ';';
+  // an existing bracket that needs nothing added: leave it untouched
+  if HasCloser and (Result = ')') then
+  begin
+    Result := '';
+    AConsume := 0;
+  end;
+end;
+
+function AnonymousArgumentText(const ALines: TArray<string>; ALine0: Integer;
+  const ACtx: TGenContext; const AInfo: TProcTypeInfo;
+  out AStartCol0, ABodyLine0, ABodyCol: Integer): string;
+var
+  S, Before, Base, Indent, Body: string;
+  Off: Integer;
+begin
+  AStartCol0 := 0;
+  ABodyLine0 := ALine0;
+  ABodyCol := 0;
+  S := '';
+  if (ALine0 >= 0) and (ALine0 <= High(ALines)) then S := ALines[ALine0];
+  Before := Copy(S, 1, Min(ACtx.PrefixStartCol, Length(S)));
+  // one level deeper than the line that holds the call's name
+  var BaseLine := S;
+  if (ACtx.CallLine >= 0) and (ACtx.CallLine <= High(ALines)) then
+    BaseLine := ALines[ACtx.CallLine];
+  Base := '';
+  for var C in BaseLine do
+    if CharInSet(C, [' ', #9]) then Base := Base + C else Break;
+  Indent := Base + '  ';
+  Body := AnonymousMethodText(AInfo, Indent, Off, ABodyCol);
+  if Trim(Before) = '' then
+  begin
+    // continuation line: replace its indentation with ours
+    AStartCol0 := 0;
+    Result := Indent + Body;
+    ABodyLine0 := ALine0 + Off;
+  end
+  else
+  begin
+    AStartCol0 := Length(TrimRight(Before));
+    Result := sLineBreak + Indent + Body;
+    ABodyLine0 := ALine0 + 1 + Off;
   end;
 end;
 
