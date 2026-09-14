@@ -80,6 +80,16 @@ type
     HasInit: Boolean;
   end;
 
+  /// <summary>ESTIMATED heap use of the index, per scope, as of the last
+  ///  publish. Raw = the per-unit identifier lists kept for incremental
+  ///  re-scans; Layer = the sorted lookup structure built from them.</summary>
+  TIndexMemory = record
+    GlobalUnits, ProjectUnits: Integer;
+    GlobalIdents, ProjectIdents: Integer;     // distinct identifiers per layer
+    GlobalRawBytes, GlobalLayerBytes: Int64;
+    ProjectRawBytes, ProjectLayerBytes: Int64;
+  end;
+
   TUnitIndex = class
   private type
     TIndexedUnit = class
@@ -130,6 +140,7 @@ type
     // changes; saving a project file rebuilds just the small project one.
     FGlobalLayer: IUnitSnapshot;
     FProjectLayer: IUnitSnapshot;
+    FMemory: TIndexMemory;   // estimate of the last publish, guarded by FLock
     class var FInstance: TUnitIndex;
     function CacheFileFor(const AKey: string): string;
     function GetSnapshot: IUnitSnapshot;
@@ -161,6 +172,9 @@ type
 
     function Ready: Boolean;
     function StatusLine: string;
+    /// <summary>Estimated memory of both scopes as of the last publish
+    ///  (computed by the worker, copied under the lock - cheap).</summary>
+    function MemoryInfo: TIndexMemory;
 
     /// <summary>Number of completed worker scan cycles. Callers that just
     ///  requested a refresh (RefreshSourcesFromEditor) can wait for this
@@ -184,6 +198,18 @@ type
 ///  old build held two extra dictionaries of the whole identifier set.
 ///  Exposed for the console tests and the memory measurement.</summary>
 function BuildUnitSnapshot(const AUnits: TArray<TUnitSource>): IUnitSnapshot;
+
+/// <summary>Estimated heap bytes the index keeps for these units in its
+///  per-path dictionary: the unit objects, path / dictionary key / unit
+///  name strings, and every identifier string with its array.</summary>
+function EstimateUnitSourcesBytes(const AUnits: TArray<TUnitSource>): Int64;
+
+/// <summary>Estimated heap bytes of a layer built by BuildUnitSnapshot on
+///  top of those units: key/display/unit arrays, upper-case key strings
+///  that are NOT shared with the identifier, and the lookup dictionary
+///  with one unit-id array per key. Identifier strings themselves are
+///  shared with the units and counted there. 0 for other snapshots.</summary>
+function EstimateSnapshotBytes(const ASnap: IUnitSnapshot): Int64;
 
 /// <summary>One view over a PROJECT and a GLOBAL layer (either may be
 ///  nil). Project units shadow global units with the same PATH, and
@@ -259,7 +285,7 @@ implementation
 uses
   System.IOUtils, System.StrUtils, System.Win.Registry, System.Types,
   System.Generics.Defaults, System.Math, Winapi.Windows,
-  Expert.EditorHelperIntf, Delphi.FileEncoding;
+  Expert.EditorHelperIntf, Delphi.FileEncoding, Expert.ResourceMonitor;
 
 const
   MaxFiles      = 40000;      // hard cap (32-bit process guard)
@@ -275,7 +301,10 @@ const
   // seeing "TcxButton / TStringGrid unknown" - which made uses-cleanup
   // offer units in use for REMOVAL, and left add-unit and "find original
   // symbol" blind for those types.
-  IndexParserVersion = '09';
+  IndexParserVersion = '10';
+  //  10: enum members under {$SCOPEDENUMS ON} are not indexed - they are
+  //      only reachable qualified ("TEnum.Test"); the tester got "add
+  //      Winapi.Networking.NetworkOperators" for an undeclared Test
   //  09: wrapped parent lists ('TFoo = class(TBase,' + continuation) no
   //      longer swallow the rest of the unit, nested class declarations
   //      count as body openers, and a top-level type opener resyncs the
@@ -441,7 +470,7 @@ var
   Lines: TArray<string>;
   Idents: TList<string>;
   I, Block, PendingEnds, ImplIdx, InParams: Integer;
-  Started, InEnum: Boolean;
+  Started, InEnum, ScopedEnums: Boolean;
   Sect: TSect;
   Code, Up, Tr, TrU: string;
 
@@ -506,6 +535,10 @@ var
 
   procedure AddEnumMembers(const S: string);
   begin
+    // {$SCOPEDENUMS ON}: members exist only as "TEnum.Member" - indexing
+    // them as global identifiers made quick fixes offer the unit for any
+    // local of the same name
+    if ScopedEnums then Exit;
     for var M in S.Split([',']) do
     begin
       var MM := Trim(M);
@@ -531,9 +564,14 @@ begin
   Idents := TList<string>.Create;
   try
     Block := 0; PendingEnds := 0; Started := False; Sect := secNone;
-    InEnum := False; ImplIdx := -1; InParams := 0;
+    InEnum := False; ImplIdx := -1; InParams := 0; ScopedEnums := False;
     for I := 0 to High(Lines) do
     begin
+      // The directive is a {...} comment to CleanLine - read it from the
+      // raw line first. It applies to the enum declarations that follow.
+      var DirP := Pos('{$SCOPEDENUMS', UpperCase(Lines[I]));
+      if DirP > 0 then
+        ScopedEnums := Pos('ON', UpperCase(Copy(Lines[I], DirP + 13, 8))) > 0;
       Code := CleanLine(Lines[I], Block);
       Tr := Trim(Code);
       if Tr = '' then Continue;
@@ -1827,6 +1865,46 @@ end;
 //  Snapshot construction and layering
 // ---------------------------------------------------------------------------
 
+function EstimateUnitSourcesBytes(const AUnits: TArray<TUnitSource>): Int64;
+var
+  I, J: Integer;
+begin
+  Result := DictionaryHeapBytes(Length(AUnits), 2 * SizeOf(Pointer));
+  for I := 0 to High(AUnits) do
+  begin
+    Inc(Result, 48);                                   // TIndexedUnit object
+    Inc(Result, 2 * StringHeapBytes(AUnits[I].Path));  // path + upper-case key
+    Inc(Result, StringHeapBytes(AUnits[I].UnitName));
+    Inc(Result, ArrayHeapBytes(Length(AUnits[I].Idents), SizeOf(Pointer)));
+    for J := 0 to High(AUnits[I].Idents) do
+      Inc(Result, StringHeapBytes(AUnits[I].Idents[J]));
+  end;
+end;
+
+function EstimateSnapshotBytes(const ASnap: IUnitSnapshot): Int64;
+var
+  S: TUnitSnapshot;
+  I, N: Integer;
+begin
+  Result := 0;
+  if (ASnap = nil) or not (ASnap is TUnitSnapshot) then Exit;
+  S := ASnap as TUnitSnapshot;
+  Result := 64;
+  N := Length(S.FUnitName);
+  Inc(Result, 2 * ArrayHeapBytes(N, SizeOf(Pointer)) + ArrayHeapBytes(N, 1));
+  N := Length(S.FKeysUpper);
+  Inc(Result, 2 * ArrayHeapBytes(N, SizeOf(Pointer)));
+  for I := 0 to N - 1 do
+    if Pointer(S.FKeysUpper[I]) <> Pointer(S.FDisplay[I]) then
+      Inc(Result, StringHeapBytes(S.FKeysUpper[I]));
+  if S.FMap <> nil then
+  begin
+    Inc(Result, DictionaryHeapBytes(S.FMap.Count, 2 * SizeOf(Pointer)));
+    for var P in S.FMap do
+      Inc(Result, ArrayHeapBytes(Length(P.Value), SizeOf(Integer)));
+  end;
+end;
+
 function BuildUnitSnapshot(const AUnits: TArray<TUnitSource>): IUnitSnapshot;
 type
   TKeyEntry = record
@@ -2278,6 +2356,12 @@ begin
   try Result := FReady; finally FLock.Leave; end;
 end;
 
+function TUnitIndex.MemoryInfo: TIndexMemory;
+begin
+  FLock.Enter;
+  try Result := FMemory; finally FLock.Leave; end;
+end;
+
 function TUnitIndex.StatusLine: string;
 begin
   FLock.Enter;
@@ -2379,22 +2463,53 @@ begin
   // allocation (a DIB section for a PNG, say) fails.
   // Now each scope is its own immutable layer; only a changed scope is
   // rebuilt, and the published view just composes the two.
+  // Memory ESTIMATES (status window) are taken here, on the worker, only
+  // for a scope that was rebuilt - walking a million identifiers is cheap
+  // next to the build itself, and far too slow for a UI tick.
+  var GlobalBuilt := False;
+  var ProjectBuilt := False;
+  var GRaw: Int64 := 0;
+  var PRaw: Int64 := 0;
   if ARebuildGlobal or (FGlobalLayer = nil) then
   begin
     FGlobalLayer := nil;            // let the old layer go BEFORE building
-    FGlobalLayer := BuildUnitSnapshot(SourcesOf(FGlobalByPath));
+    var Src := SourcesOf(FGlobalByPath);
+    FGlobalLayer := BuildUnitSnapshot(Src);
+    GRaw := EstimateUnitSourcesBytes(Src);
+    GlobalBuilt := True;
   end;
   if ARebuildProject or (FProjectLayer = nil) then
   begin
     FProjectLayer := nil;
-    FProjectLayer := BuildUnitSnapshot(SourcesOf(FProjectByPath));
+    var Src := SourcesOf(FProjectByPath);
+    FProjectLayer := BuildUnitSnapshot(Src);
+    PRaw := EstimateUnitSourcesBytes(Src);
+    ProjectBuilt := True;
   end;
+  var GLayer: Int64 := 0;
+  var PLayer: Int64 := 0;
+  if GlobalBuilt then GLayer := EstimateSnapshotBytes(FGlobalLayer);
+  if ProjectBuilt then PLayer := EstimateSnapshotBytes(FProjectLayer);
 
   Snap := ComposeUnitSnapshots(FProjectLayer, FGlobalLayer);
   FLock.Enter;
   try
     FSnapshot := Snap;   // atomic reference swap; readers scan lock-free
     FReady := True;
+    if GlobalBuilt then
+    begin
+      FMemory.GlobalRawBytes := GRaw;
+      FMemory.GlobalLayerBytes := GLayer;
+      FMemory.GlobalUnits := FGlobalLayer.UnitCount;
+      FMemory.GlobalIdents := FGlobalLayer.IdentCount;
+    end;
+    if ProjectBuilt then
+    begin
+      FMemory.ProjectRawBytes := PRaw;
+      FMemory.ProjectLayerBytes := PLayer;
+      FMemory.ProjectUnits := FProjectLayer.UnitCount;
+      FMemory.ProjectIdents := FProjectLayer.IdentCount;
+    end;
   finally
     FLock.Leave;
   end;

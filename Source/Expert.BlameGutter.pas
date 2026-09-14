@@ -50,6 +50,11 @@ procedure SetBlameEnabled(AValue: Boolean);
 /// <summary>Status row: what the feature is currently doing.</summary>
 function BlameGutterStatus: string;
 
+/// <summary>ESTIMATED heap bytes of the gutter's own copies: the last
+///  modified file's disk lines and the remapped per-buffer-line blame.
+///  MAIN THREAD.</summary>
+function BlameGutterBytes: Int64;
+
 /// <summary>Re-reads the options (on/off, column width, what to show) and
 ///  applies them at once - the width is restored first, so switching the
 ///  column off never leaves a widened gutter behind.</summary>
@@ -136,6 +141,14 @@ var
 function BlameEnabled: Boolean;
 begin
   Result := GEnabled;
+end;
+
+function BlameGutterBytes: Int64;
+begin
+  Result := ArrayHeapBytes(Length(GDiskLines), SizeOf(Pointer))
+    + ArrayHeapBytes(Length(GMapped), SizeOf(TBlameLine));
+  for var L in GDiskLines do
+    Inc(Result, StringHeapBytes(L));
 end;
 
 function BlameGutterStatus: string;

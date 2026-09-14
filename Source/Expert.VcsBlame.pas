@@ -119,6 +119,10 @@ procedure InvalidateBlame(const AFile: string);
 /// <summary>One line for the status window: what the last attempt did.</summary>
 function BlameStatus: string;
 
+/// <summary>ESTIMATED heap bytes of the blame cache - every file blamed in
+///  this session is kept (no eviction). AFiles / ALines: what it holds.</summary>
+function BlameCacheBytes(out AFiles, ALines: Integer): Int64;
+
 /// <summary>Splits a unified diff into its per-file sections (git:
 ///  "diff --git a/x b/x", svn: "Index: x"). Pure and tested.</summary>
 function SplitDiffPerFile(const ADiff: string; AKind: TVcsKind): TArray<TCommitFile>;
@@ -160,7 +164,8 @@ implementation
 
 uses
   System.IOUtils, System.DateUtils, System.SyncObjs, System.Math,
-  System.StrUtils, System.Win.Registry, Winapi.Windows, Winapi.ShellAPI;
+  System.StrUtils, System.Win.Registry, Winapi.Windows, Winapi.ShellAPI,
+  Expert.ResourceMonitor;
 
 { TBlameLine }
 
@@ -729,6 +734,43 @@ procedure SetStatus(const S: string);
 begin
   GLock.Enter;
   try GStatus := S; finally GLock.Leave; end;
+end;
+
+function BlameCacheBytes(out AFiles, ALines: Integer): Int64;
+var
+  I: Integer;
+begin
+  Result := 0;
+  AFiles := 0;
+  ALines := 0;
+  if (GLock = nil) or (GCache = nil) then Exit;
+  GLock.Enter;
+  try
+    Inc(Result, DictionaryHeapBytes(GCache.Count, 2 * SizeOf(Pointer)));
+    for var P in GCache do
+    begin
+      Inc(AFiles);
+      Inc(Result, StringHeapBytes(P.Key) + 48);
+      if P.Value = nil then Continue;
+      Inc(ALines, Length(P.Value.Lines));
+      Inc(Result, ArrayHeapBytes(Length(P.Value.Lines), SizeOf(TBlameLine)));
+      // consecutive lines of one commit share their strings - count each
+      // run once (a commit's author/summary recurring later is counted
+      // again: a slight over-estimate, without any allocation here)
+      for I := 0 to High(P.Value.Lines) do
+        with P.Value.Lines[I] do
+        begin
+          if (I = 0) or (Pointer(Hash) <> Pointer(P.Value.Lines[I - 1].Hash)) then
+            Inc(Result, StringHeapBytes(Hash));
+          if (I = 0) or (Pointer(Author) <> Pointer(P.Value.Lines[I - 1].Author)) then
+            Inc(Result, StringHeapBytes(Author));
+          if (I = 0) or (Pointer(Summary) <> Pointer(P.Value.Lines[I - 1].Summary)) then
+            Inc(Result, StringHeapBytes(Summary));
+        end;
+    end;
+  finally
+    GLock.Leave;
+  end;
 end;
 
 function BlameStatus: string;

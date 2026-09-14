@@ -192,6 +192,12 @@ type
     /// <summary>Total inactive ranges across all known files.</summary>
     function GetInactiveRangesTotal: Integer;
 
+    /// <summary>ESTIMATED heap bytes this client retains: diagnostics of
+    ///  every file DelphiLSP ever pushed (all severities, with messages),
+    ///  inactive ranges and the per-file bookkeeping. For the status
+    ///  window - takes the diagnostics lock and walks everything.</summary>
+    function EstimateRetainedBytes: Int64;
+
     /// <summary>True iff DelphiLSP has pushed at least one
     ///  publishDiagnostics notification for AFilePath (even if empty).
     ///  Used to decide whether IsLineInactive is meaningful or still
@@ -1355,6 +1361,44 @@ end;
 function TLspClient.GetDiagnosticsCount: Integer;
 begin
   Result := FDiagnosticsCount;
+end;
+
+function TLspClient.EstimateRetainedBytes: Int64;
+
+  // Same 32-bit estimate as Expert.ResourceMonitor - repeated here, the Lsp
+  // units stay free of Expert.* dependencies.
+  function SB(const S: string): Int64;
+  begin
+    if S = '' then Exit(0);
+    Result := ((12 + (Int64(Length(S)) + 1) * 2 + 4 + 7) div 8) * 8;
+  end;
+
+  function LB(ACapacity, AElem: Integer): Int64;   // TList object + buffer
+  begin
+    Result := 32;
+    if ACapacity > 0 then
+      Inc(Result, ((8 + Int64(ACapacity) * AElem + 4 + 7) div 8) * 8);
+  end;
+
+begin
+  Result := 0;
+  FInactiveRangesLock.Enter;
+  try
+    for var P in FErrorDiags do
+    begin
+      Inc(Result, SB(P.Key) + 24 + LB(P.Value.Capacity, SizeOf(TLspErrorDiag)));
+      for var D in P.Value do
+        Inc(Result, SB(D.Code) + SB(D.Message));
+    end;
+    for var P in FInactiveRanges do
+      Inc(Result, SB(P.Key) + 24 + LB(P.Value.Capacity, SizeOf(TLspRange)));
+    for var K in FFileDiagVersion.Keys do
+      Inc(Result, SB(K) + 24);
+    for var K in FFilesWithDiagnostics.Keys do
+      Inc(Result, SB(K) + 24);
+  finally
+    FInactiveRangesLock.Leave;
+  end;
 end;
 
 function TLspClient.GetInactiveRangesTotal: Integer;

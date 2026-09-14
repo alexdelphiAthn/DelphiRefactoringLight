@@ -44,7 +44,7 @@ type
   TQuickFixKind = (qfAddUnit, qfRenameIdent, qfFixUsesName, qfRemoveUses,
     qfAlignHeader, qfRemoveVar, qfInsertSemi, qfInitVar, qfRemoveAssign,
     qfAddReintroduce, qfImplStub, qfClassStub, qfRemoveToken,
-    qfRemovePrivate);
+    qfRemovePrivate, qfDeclareVar, qfDeclareInlineVar);
 
   /// <summary>One concrete, applicable fix action derived from a compiler
   ///  diagnostic. See ResolveQuickFixes for the providers.</summary>
@@ -106,6 +106,28 @@ function IdentDeclaredInFile(const AContent, AIdent: string): Boolean;
 ///  matching-form candidate exists - otherwise all hits are kept.</summary>
 function FilterHitsByGenericUse(const AHits: TArray<TFindUnitHit>;
   AGenericUse: Boolean): TArray<TFindUnitHit>;
+
+/// <summary>The type an assignment's right-hand side gives away without
+///  a compiler: "TList<Integer>.Create" -> 'TList<Integer>' (any
+///  Create* constructor, generic or qualified types), string / integer /
+///  float / Boolean literals. '' when it cannot be told from the text.</summary>
+/// <summary>Generic type uses on a source line: identifiers directly
+///  followed by '<' and a type argument ("TList<Integer>" -> 'TList' at
+///  its 0-based column). Strings and comments are skipped, qualified names
+///  ("Generics.Collections.TList<") too - they name their unit.</summary>
+function GenericUseTokens(const ALine: string; out ACols: TArray<Integer>): TArray<string>;
+
+function InferAssignedType(const ARhs: string): string;
+
+/// <summary>Where a local declaration "AIdent: AType;" for a use at
+///  AUseLine0 goes: before the enclosing routine's 'begin', inside its
+///  var section, or with a new 'var' line when the last section is none
+///  or const/type/label. AText is raw text incl. line breaks, to insert
+///  at the START of line AInsertLine0. False without an enclosing routine
+///  or with a nested routine before the body.</summary>
+function PlanLocalVarDecl(const ALines: TArray<string>; AUseLine0: Integer;
+  const AIdent, AType: string; out AInsertLine0: Integer;
+  out AText: string): Boolean;
 
 /// <summary>Executes one quick fix. AUnitChoice picks the candidate unit
 ///  for qfAddUnit (index into UnitNames).</summary>
@@ -195,6 +217,10 @@ procedure LiveResetResults;
 ///  Reads UI-thread state only - call it from a timer tick.</summary>
 procedure LiveStatusInfo(out AFile: string; out AAnalysing, AResolving,
   AFromLsp, AFresh: Boolean; out AFixCount: Integer);
+
+/// <summary>ESTIMATED heap bytes the live checker holds: the last pending
+///  buffer copy with its diagnostics and the published fixes. MAIN THREAD.</summary>
+function LiveMemoryBytes: Int64;
 
 type
   /// <summary>Record describing one private member that H2219 flagged and
@@ -831,6 +857,198 @@ begin
   else if Length(GResolveNote) < 300 then GResolveNote := GResolveNote + '; ' + S;
 end;
 
+// ---------------------------------------------------------------------------
+//  E2003 on an assignment target: declare the variable
+// ---------------------------------------------------------------------------
+
+function DvStripComment(const S: string): string;
+var
+  P: Integer;
+begin
+  Result := S;
+  P := Pos('//', Result);
+  if P > 0 then Result := Copy(Result, 1, P - 1);
+end;
+
+function GenericUseTokens(const ALine: string; out ACols: TArray<Integer>): TArray<string>;
+var
+  I, J, K, N: Integer;
+begin
+  Result := nil;
+  ACols := nil;
+  I := 1;
+  while I <= Length(ALine) do
+  begin
+    if ALine[I] = '''' then
+    begin
+      Inc(I);
+      while (I <= Length(ALine)) and (ALine[I] <> '''') do Inc(I);
+      Inc(I);
+      Continue;
+    end;
+    if (ALine[I] = '/') and (I < Length(ALine)) and (ALine[I + 1] = '/') then Break;
+    if ALine[I] = '{' then Break;
+    if CharInSet(ALine[I], ['A'..'Z', 'a'..'z', '_']) then
+    begin
+      J := I;
+      while (J <= Length(ALine)) and CharInSet(ALine[J], ['A'..'Z', 'a'..'z', '0'..'9', '_']) do
+        Inc(J);
+      K := J;
+      while (K <= Length(ALine)) and CharInSet(ALine[K], [' ', #9]) do Inc(K);
+      // "Name<" followed by a type argument, ',' or '>' - and not qualified:
+      // "Generics.Collections.TList<" names its unit already
+      if (K <= Length(ALine)) and (ALine[K] = '<') and ((I = 1) or (ALine[I - 1] <> '.')) then
+      begin
+        N := K + 1;
+        while (N <= Length(ALine)) and CharInSet(ALine[N], [' ', #9]) do Inc(N);
+        if (N <= Length(ALine)) and CharInSet(ALine[N], ['A'..'Z', 'a'..'z', '_', ',', '>']) then
+        begin
+          Result := Result + [Copy(ALine, I, J - I)];
+          ACols := ACols + [I - 1];
+        end;
+      end;
+      I := J;
+      Continue;
+    end;
+    Inc(I);
+  end;
+end;
+
+function InferAssignedType(const ARhs: string): string;
+var
+  S, U, Member, T: string;
+  I, Depth, LastDot, Dummy: Integer;
+  D64: Int64;
+begin
+  Result := '';
+  S := Trim(ARhs);
+  if (S <> '') and (S[1] <> '''') then S := Trim(DvStripComment(S));
+  if S.EndsWith(';') then S := Trim(Copy(S, 1, Length(S) - 1));
+  if S = '' then Exit;
+  U := UpperCase(S);
+  if (U = 'TRUE') or (U = 'FALSE') then Exit('Boolean');
+  if S[1] = '''' then Exit('string');
+  if TryStrToInt(S, Dummy) then Exit('Integer');
+  if TryStrToInt64(S, D64) then Exit('Int64');
+  if CharInSet(S[1], ['0'..'9']) then
+  begin
+    var FS := TFormatSettings.Invariant;
+    var Dbl: Double;
+    if TryStrToFloat(S, Dbl, FS) then Exit('Double');
+    Exit;
+  end;
+  // constructor call: "<type>.Create...", the type possibly generic
+  // ("TDictionary<string, TList<Integer>>") or qualified
+  Depth := 0;
+  LastDot := 0;
+  for I := 1 to Length(S) do
+  begin
+    case S[I] of
+      '<': Inc(Depth);
+      '>': Dec(Depth);
+      '.': if Depth = 0 then LastDot := I;
+    end;
+    if S[I] = '(' then Break;
+  end;
+  if LastDot <= 1 then Exit;
+  Member := Copy(S, LastDot + 1, MaxInt);
+  I := Pos('(', Member);
+  if I > 0 then Member := Copy(Member, 1, I - 1);
+  Member := Trim(Member);
+  // While TYPING the call is not complete yet: "TList<Integer>." or
+  // "TStringList.Cre" (tester screenshot) - accepted as well, but then the
+  // left part must LOOK like a type (generic arguments or the TXxx naming
+  // convention), or "FList." would turn a variable into a type.
+  var Partial := not StartsText('Create', Member);
+  if Partial and not StartsText(Member, 'Create') then Exit;
+  for I := 1 to Length(Member) do
+    if not CharInSet(Member[I], ['A'..'Z', 'a'..'z', '0'..'9', '_']) then Exit;
+  T := Trim(Copy(S, 1, LastDot - 1));
+  if (T = '') or not CharInSet(T[1], ['A'..'Z', 'a'..'z', '_']) then Exit;
+  Depth := 0;
+  for I := 1 to Length(T) do
+  begin
+    if not CharInSet(T[I], ['A'..'Z', 'a'..'z', '0'..'9', '_', '.', '<', '>', ',', ' ']) then Exit;
+    if T[I] = '<' then Inc(Depth);
+    if T[I] = '>' then Dec(Depth);
+    if Depth < 0 then Exit;
+  end;
+  if Depth <> 0 then Exit;
+  if Partial then
+  begin
+    var Last := T;
+    var LtP := Pos('<', Last);
+    if LtP > 0 then Last := Copy(Last, 1, LtP - 1);
+    Last := Trim(Last);
+    var DotP := LastDelimiter('.', Last);
+    if DotP > 0 then Last := Copy(Last, DotP + 1, MaxInt);
+    if not ((LtP > 0) or ((Length(Last) >= 2) and (Last[1] = 'T')
+      and CharInSet(Last[2], ['A'..'Z']))) then Exit;
+  end;
+  Result := T;
+end;
+
+function PlanLocalVarDecl(const ALines: TArray<string>; AUseLine0: Integer;
+  const AIdent, AType: string; out AInsertLine0: Integer;
+  out AText: string): Boolean;
+var
+  First, Last, HdrEnd, BeginLine, LastSect, Bal, I: Integer;
+  T, U, Indent: string;
+begin
+  Result := False;
+  AInsertLine0 := -1;
+  AText := '';
+  if (AIdent = '') or (AType = '') then Exit;
+  if (AUseLine0 < 0) or (AUseLine0 > High(ALines)) then Exit;
+  if not FindEnclosingRoutineRange(string.Join(sLineBreak, ALines), AUseLine0,
+    First, Last) then Exit;
+  // the header may wrap its parameter list - a "var X: Integer" parameter
+  // line must not read as the routine's var section
+  HdrEnd := First;
+  Bal := 0;
+  for I := First to Min(Last, First + 30) do
+  begin
+    T := DvStripComment(ALines[I]);
+    Inc(Bal, T.CountChar('(') - T.CountChar(')'));
+    if (Bal <= 0) and (Pos(';', T) > 0) then
+    begin
+      HdrEnd := I;
+      Break;
+    end;
+  end;
+  BeginLine := -1;
+  LastSect := 0;   // 0 none, 1 var, 2 const/type/label
+  for I := HdrEnd + 1 to Min(Last, AUseLine0) do
+  begin
+    T := Trim(DvStripComment(ALines[I]));
+    U := UpperCase(T);
+    if U = 'BEGIN' then
+    begin
+      BeginLine := I;
+      Break;
+    end;
+    // a NESTED routine before the body: its sections would be mistaken for
+    // ours - no local declaration then (the inline form stays available)
+    var K: string;
+    var CM: Boolean;
+    if IsHeaderLine(T, K, CM) then Exit;
+    if (U = 'VAR') or U.StartsWith('VAR ') then LastSect := 1
+    else if (U = 'CONST') or U.StartsWith('CONST ') or (U = 'TYPE')
+      or U.StartsWith('TYPE ') or (U = 'LABEL') or U.StartsWith('LABEL ') then
+      LastSect := 2;
+  end;
+  if (BeginLine < 0) or (BeginLine >= AUseLine0) then Exit;
+  Indent := Copy(ALines[BeginLine], 1,
+    Length(ALines[BeginLine]) - Length(TrimLeft(ALines[BeginLine])));
+  if LastSect = 1 then
+    AText := Indent + '  ' + AIdent + ': ' + AType + ';' + sLineBreak
+  else
+    AText := Indent + 'var' + sLineBreak +
+      Indent + '  ' + AIdent + ': ' + AType + ';' + sLineBreak;
+  AInsertLine0 := BeginLine;
+  Result := True;
+end;
+
 function ResolveQuickFixes(const AContent: string;
   const ADiags: TArray<TLspErrorDiag>): TArray<TQuickFix>;
 var
@@ -857,6 +1075,173 @@ var
     Result := TokenAt(LnTxt, D.Range.Start.Character + 1, AAllowDots, ACol0, ALen);
     if Result then
       AText := Copy(LnTxt, ACol0 + 1, ALen);
+  end;
+
+  // E2003 for an identifier ASSIGNED TO as a statement of its own
+  // ("Test := TList<Integer>.Create;") is almost always a variable that
+  // was not declared yet - "add unit" makes no sense there (user report).
+  // Offered FIRST: a local variable with the type read off the right-hand
+  // side (constructor call or literal) and the inline "var X := ...",
+  // which needs no type. The type's unit is added along when exactly one
+  // unit declares it and it is not reachable yet.
+  // E2029 "'(' expected but '>' found" (tester screenshot, line
+  // "var Test := TList<Integer>."): with an UNKNOWN generic type Error
+  // Insight never reports E2003 - "TList<Integer>" parses as
+  // "TList < Integer >" and fails at the '>'. So every E2029 line is
+  // searched for generic uses whose GENERIC declaration lives in a unit
+  // that is not reachable yet; a reachable one means the error is
+  // something else and nothing is offered.
+  procedure AddGenericUnit(const D: TLspErrorDiag);
+  var
+    Cols: TArray<Integer>;
+    Names: TArray<string>;
+    F: TQuickFix;
+  begin
+    if (Snap = nil) or (D.Range.Start.Line < 0) or (D.Range.Start.Line > High(Lines)) then Exit;
+    Names := GenericUseTokens(Lines[D.Range.Start.Line], Cols);
+    for var I := 0 to High(Names) do
+    begin
+      var Key := 'I|' + IntToStr(D.Range.Start.Line) + '|' + UpperCase(Names[I]);
+      if Seen.ContainsKey(Key) then Continue;
+      if IdentDeclaredInFile(AContent, Names[I]) then Continue;
+      var Gen: TArray<TFindUnitHit> := nil;
+      for var H in Snap.Lookup(Names[I]) do
+        if H.IsGeneric then Gen := Gen + [H];
+      Gen := DedupeByUnitName(Gen);
+      if Length(Gen) = 0 then Continue;
+      var Sect := SectionFor(D.Range.Start.Line);
+      var Visible := False;
+      var Usable: TArray<TFindUnitHit> := nil;
+      for var H in Gen do
+        if UnitReachableFrom(AContent, H.UnitName, Sect) then
+          Visible := True
+        else
+          Usable := Usable + [H];
+      if Visible or (Length(Usable) = 0) then Continue;
+      Seen.Add(Key, True);
+      F := Default(TQuickFix);
+      F.Kind := qfAddUnit;
+      F.Line := D.Range.Start.Line;
+      F.Col := Cols[I];
+      F.TokenLen := Length(Names[I]);
+      F.Identifier := Names[I] + '<>';
+      F.Caption := Format('Add unit for "%s"', [F.Identifier]);
+      F.Section := Sect;
+      for var H in Usable do
+        F.UnitNames := F.UnitNames + [H.UnitName];
+      Res.Add(F);
+    end;
+  end;
+
+  function AddDeclareVar(ALine0, ACol0, ALen: Integer; const AIdent: string): Boolean;
+
+    function HasWord(const S: string): Boolean;
+    var
+      P, E: Integer;
+      US, UI: string;
+    begin
+      Result := False;
+      US := UpperCase(S);
+      UI := UpperCase(AIdent);
+      P := Pos(UI, US);
+      while P > 0 do
+      begin
+        E := P + Length(UI);
+        if ((P = 1) or not CharInSet(US[P - 1], ['A'..'Z', '0'..'9', '_', '.']))
+          and ((E > Length(US)) or not CharInSet(US[E], ['A'..'Z', '0'..'9', '_'])) then
+          Exit(True);
+        P := PosEx(UI, US, P + 1);
+      end;
+    end;
+
+  var
+    S, Rest, TypeText, FollowUp, DeclText: string;
+    F: TQuickFix;
+    First, Last, InsLine: Integer;
+  begin
+    Result := False;
+    if (ALine0 < 0) or (ALine0 > High(Lines)) then Exit;
+    S := Lines[ALine0];
+    if Trim(Copy(S, 1, ACol0)) <> '' then Exit;              // must START the statement
+    Rest := TrimLeft(Copy(S, ACol0 + ALen + 1, MaxInt));
+    if not Rest.StartsWith(':=') then Exit;
+    if not FindEnclosingRoutineRange(AContent, ALine0, First, Last) then Exit;
+    TypeText := InferAssignedType(Copy(Rest, 3, MaxInt));
+    var Sect := SectionFor(ALine0);
+
+    FollowUp := '';
+    if (TypeText <> '') and (Snap <> nil) then
+    begin
+      var Base := TypeText;
+      var LtP := Pos('<', Base);
+      var IsGen := LtP > 0;
+      if IsGen then Base := Copy(Base, 1, LtP - 1);
+      Base := Trim(Base);
+      var DotP := LastDelimiter('.', Base);
+      if DotP > 0 then Base := Copy(Base, DotP + 1, MaxInt);
+      var BuiltIn := SameText(Base, 'string') or SameText(Base, 'Integer')
+        or SameText(Base, 'Int64') or SameText(Base, 'Double') or SameText(Base, 'Boolean');
+      if not BuiltIn then
+      begin
+        var Hits := DedupeByUnitName(FilterHitsByGenericUse(Snap.Lookup(Base), IsGen));
+        var Reachable := False;
+        for var H in Hits do
+          if UnitReachableFrom(AContent, H.UnitName, Sect) then
+          begin
+            Reachable := True;
+            Break;
+          end;
+        if (not Reachable) and (Length(Hits) = 1) then
+          FollowUp := Hits[0].UnitName;
+      end;
+    end;
+
+    if (TypeText <> '')
+      and PlanLocalVarDecl(Lines, ALine0, AIdent, TypeText, InsLine, DeclText) then
+    begin
+      F := Default(TQuickFix);
+      F.Kind := qfDeclareVar;
+      F.Line := ALine0;
+      F.Col := ACol0;
+      F.TokenLen := ALen;
+      F.Identifier := AIdent;
+      F.NewText := TypeText;
+      F.Section := Sect;
+      F.FollowUpUnit := FollowUp;
+      F.Caption := Format('Declare local variable "%s: %s"', [AIdent, TypeText]);
+      if FollowUp <> '' then
+        F.Caption := F.Caption + Format('  (+ uses %s)', [FollowUp]);
+      Res.Add(F);
+      Result := True;
+    end;
+
+    // inline form: only at the FIRST use inside the routine, and never as
+    // the lone statement of a then/do/else ("if A then var X := 1;" does
+    // not compile)
+    for var I := First to ALine0 - 1 do
+      if HasWord(DvStripComment(Lines[I])) then Exit;
+    for var I := ALine0 - 1 downto First do
+    begin
+      var P := UpperCase(Trim(DvStripComment(Lines[I])));
+      if P = '' then Continue;
+      if (P = 'THEN') or P.EndsWith(' THEN') or (P = 'DO') or P.EndsWith(' DO')
+        or (P = 'ELSE') or P.EndsWith(' ELSE') then Exit;
+      Break;
+    end;
+    F := Default(TQuickFix);
+    F.Kind := qfDeclareInlineVar;
+    F.Line := ALine0;
+    F.Col := ACol0;
+    F.TokenLen := ALen;
+    F.Identifier := AIdent;
+    F.NewText := TypeText;
+    F.Section := Sect;
+    F.FollowUpUnit := FollowUp;
+    F.Caption := Format('Declare inline variable "var %s := ..."', [AIdent]);
+    if FollowUp <> '' then
+      F.Caption := F.Caption + Format('  (+ uses %s)', [FollowUp]);
+    Res.Add(F);
+    Result := True;
   end;
 
   procedure AddE2003(const D: TLspErrorDiag);
@@ -888,6 +1273,11 @@ var
     // produce identical fixes. One fix per (identifier, line).
     if Seen.ContainsKey('I|' + IntToStr(D.Range.Start.Line) + '|' + UpperCase(Ident)) then Exit;
     Seen.Add('I|' + IntToStr(D.Range.Start.Line) + '|' + UpperCase(Ident), True);
+    // An assignment target that can be declared here: "add unit" (some
+    // unit declares an enum member / const of that name - tester got
+    // "Add Winapi.Networking.NetworkOperators" for Test) and "did you
+    // mean" (index identifiers, not locals) only get in the way.
+    if AddDeclareVar(D.Range.Start.Line, Col0, Len, Ident) then Exit;
 
     if Snap = nil then
     begin
@@ -1566,6 +1956,7 @@ begin
       // the IDE's Error Insight reports a broken/misspelled uses entry as
       // F2063 (observed empirically), the batch compiler as F2613 - both
       // anchor at the uses entry and get the same repair actions.
+      if SameText(D.Code, 'E2029') then AddGenericUnit(D);
       if SameText(D.Code, 'E2003') then AddE2003(D)
       else if SameText(D.Code, 'F2613') or SameText(D.Code, 'F2063') then AddF2613(D)
       else if SameText(D.Code, 'E2037') then AddE2037(D)
@@ -2426,6 +2817,36 @@ begin
   end;
 end;
 
+// E2003 declare-variable fix: a local declaration in the routine's var
+// section (created when missing) or the inline "var X :=" form - both
+// re-validated against the current buffer, then the planned unit.
+function DeclareVariable(const AFile: string; const AFix: TQuickFix): Boolean;
+var
+  Content, S, Ident, Text: string;
+  Lines: TArray<string>;
+  InsLine: Integer;
+begin
+  Result := False;
+  if (Editor = nil) or not ReadCurrentContent(AFile, Content) then Exit;
+  Lines := SplitContentLines(Content);
+  if (AFix.Line < 0) or (AFix.Line > High(Lines)) then Exit;
+  S := Lines[AFix.Line];
+  // stale guard: the identifier still starts the assignment
+  Ident := Copy(S, AFix.Col + 1, AFix.TokenLen);
+  if not SameText(Ident, AFix.Identifier) then Exit;
+  if Trim(Copy(S, 1, AFix.Col)) <> '' then Exit;
+  if not TrimLeft(Copy(S, AFix.Col + AFix.TokenLen + 1, MaxInt)).StartsWith(':=') then Exit;
+  if AFix.Kind = qfDeclareInlineVar then
+    Result := ReplaceTokenInLine(AFile, AFix.Line, AFix.Col, AFix.TokenLen, 'var ' + Ident)
+  else
+  begin
+    if not PlanLocalVarDecl(Lines, AFix.Line, Ident, AFix.NewText, InsLine, Text) then Exit;
+    Result := Editor.InsertTextAtLineStart(AFile, InsLine + 1, Text);
+  end;
+  if Result and (AFix.FollowUpUnit <> '') then
+    AddUnitToUses(AFile, AFix.FollowUpUnit, AFix.Section);
+end;
+
 // Executes one quick fix. AUnitChoice picks the candidate unit for
 // qfAddUnit (index into UnitNames).
 function ApplyQuickFix(const AFile: string; const AFix: TQuickFix;
@@ -2471,6 +2892,8 @@ begin
     qfRemoveToken:
       Result := RemoveStrayToken(AFile, AFix.NewText, AFix.Identifier,
         AFix.Line, AFix.Col);
+    qfDeclareVar, qfDeclareInlineVar:
+      Result := DeclareVariable(AFile, AFix);
     qfRemovePrivate:
       begin
         var Info := Default(TPrivateMember);
@@ -2682,7 +3105,8 @@ begin
             FList.Items.Add(A.Caption);
           end;
         qfInsertSemi, qfInitVar, qfRemoveAssign, qfAddReintroduce,
-        qfImplStub, qfClassStub, qfRemoveToken, qfRemovePrivate:
+        qfImplStub, qfClassStub, qfRemoveToken, qfRemovePrivate,
+        qfDeclareVar, qfDeclareInlineVar:
           begin
             // These carry an action-ready caption from the resolver.
             A.Caption := FFixes[I].Caption;
@@ -4172,6 +4596,27 @@ function LiveResolveBusy: Boolean;
 begin
   Result := (GLive <> nil)
     and (GLive.FResolving or GLive.FHasPending or GLive.FAnalysing);
+end;
+
+function LiveMemoryBytes: Int64;
+begin
+  Result := 0;
+  if GLive = nil then Exit;
+  Inc(Result, StringHeapBytes(GLive.FPendContent));
+  Inc(Result, ArrayHeapBytes(Length(GLive.FPendDiags), SizeOf(TLspErrorDiag)));
+  for var I := 0 to High(GLive.FPendDiags) do
+    Inc(Result, StringHeapBytes(GLive.FPendDiags[I].Code)
+      + StringHeapBytes(GLive.FPendDiags[I].Message));
+  Inc(Result, ArrayHeapBytes(Length(GLive.FResults), SizeOf(TQuickFix)));
+  for var I := 0 to High(GLive.FResults) do
+    with GLive.FResults[I] do
+    begin
+      Inc(Result, StringHeapBytes(Caption) + StringHeapBytes(NewText)
+        + StringHeapBytes(Identifier) + StringHeapBytes(FollowUpUnit)
+        + StringHeapBytes(OldUnit) + ArrayHeapBytes(Length(UnitNames), SizeOf(Pointer)));
+      for var U in UnitNames do
+        Inc(Result, StringHeapBytes(U));
+    end;
 end;
 
 procedure LiveStatusInfo(out AFile: string; out AAnalysing, AResolving,

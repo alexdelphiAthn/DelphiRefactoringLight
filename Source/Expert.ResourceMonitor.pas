@@ -69,6 +69,25 @@ function ResourceSampleText(const S: TResourceSample): string;
 procedure StartResourceMonitor;
 procedure StopResourceMonitor;
 
+// ---- heap size ESTIMATES (status window "memory held by this plugin") ----
+// The plugin shares the IDE's memory manager, so "how much is ours" cannot
+// be measured - it is estimated from the data structures instead. The
+// numbers follow the 32-bit layout: a string is a 12-byte header plus
+// UTF-16 characters, a dynamic array an 8-byte header, and the memory
+// manager adds a few bytes and rounds each block up.
+
+/// <summary>Heap bytes of one string instance ('' = 0).</summary>
+function StringHeapBytes(const S: string): Int64;
+/// <summary>Heap bytes of a dynamic array (or list buffer) of ACount
+///  elements of AElemSize bytes.</summary>
+function ArrayHeapBytes(ACount, AElemSize: Integer): Int64;
+/// <summary>Heap bytes of a TDictionary's slot array holding ACount
+///  entries (key + value + hash per slot; the table grows in powers of two
+///  and keeps 25% free).</summary>
+function DictionaryHeapBytes(ACount, AKeyValueSize: Integer): Int64;
+/// <summary>"12.3" (MB, one decimal).</summary>
+function MBText(ABytes: Int64): string;
+
 implementation
 
 uses
@@ -229,6 +248,32 @@ type
 
 var
   GSink: TMonitorSink = nil;
+
+function StringHeapBytes(const S: string): Int64;
+begin
+  if S = '' then Exit(0);
+  Result := ((12 + (Int64(Length(S)) + 1) * 2 + 4 + 7) div 8) * 8;
+end;
+
+function ArrayHeapBytes(ACount, AElemSize: Integer): Int64;
+begin
+  if ACount <= 0 then Exit(0);
+  Result := ((8 + Int64(ACount) * AElemSize + 4 + 7) div 8) * 8;
+end;
+
+function DictionaryHeapBytes(ACount, AKeyValueSize: Integer): Int64;
+var
+  Cap: Int64;
+begin
+  Cap := 4;
+  while Cap * 3 div 4 < ACount do Cap := Cap * 2;
+  Result := 48 + ArrayHeapBytes(Integer(Cap), AKeyValueSize + SizeOf(Integer));
+end;
+
+function MBText(ABytes: Int64): string;
+begin
+  Result := FormatFloat('0.0', ABytes / 1048576);
+end;
 
 function LogPath: string;
 begin

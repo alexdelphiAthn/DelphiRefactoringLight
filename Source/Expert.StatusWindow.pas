@@ -76,6 +76,8 @@ type
     FMsgCountTick: Integer;
     FResSample: TResourceSample;   // refreshed every 5th tick (VA walk)
     FResValid: Boolean;
+    FMemText, FMemDetail: string;  // refreshed every 10th tick (walks caches)
+    FMemValid: Boolean;
     procedure DoTick(Sender: TObject);
     procedure Row(const ACaption, AValue, ADetail: string);
     procedure DoListDblClick(Sender: TObject);
@@ -227,6 +229,50 @@ begin
   end;
 end;
 
+// What THIS plugin keeps in memory, per consumer. The plugin shares the
+// IDE's memory manager, so this cannot be measured - it is estimated from
+// the data structures (Expert.ResourceMonitor's heap-size helpers). Asked
+// for by a user whose IDE needs 2 GB for a large project on its own and
+// then runs out of memory with the plugin loaded.
+function PluginMemoryText(out ADetail: string): string;
+var
+  Idx: TIndexMemory;
+  Lsp, Blame, Gutter, Live, IdxLib, IdxPrj, Total: Int64;
+  BlFiles, BlLines: Integer;
+  Client: TLspClient;
+begin
+  Idx := TUnitIndex.Instance.MemoryInfo;
+  Lsp := 0;
+  if TLspManager.Instance.IsAlive then
+  begin
+    Client := TLspManager.Instance.PeekClient;
+    if Client <> nil then
+      try
+        Lsp := Client.EstimateRetainedBytes;
+      except
+        Lsp := 0;
+      end;
+  end;
+  Blame := BlameCacheBytes(BlFiles, BlLines);
+  Gutter := BlameGutterBytes;
+  Live := LiveMemoryBytes;
+  IdxLib := Idx.GlobalRawBytes + Idx.GlobalLayerBytes;
+  IdxPrj := Idx.ProjectRawBytes + Idx.ProjectLayerBytes;
+  Total := IdxLib + IdxPrj + Lsp + Blame + Gutter + Live;
+  Result := Format('~%s MB: index library %s, project %s | LSP diagnostics %s | ' +
+    'blame %s | live checker %s',
+    [MBText(Total), MBText(IdxLib), MBText(IdxPrj), MBText(Lsp),
+     MBText(Blame + Gutter), MBText(Live)]);
+  ADetail := Format('ESTIMATE from our data structures (MB), refreshed every 10 s. ' +
+    'Library index: %d units, %d identifiers = identifier lists %s + lookup %s ' +
+    '(a library rescan builds the lookup a second time for a moment). ' +
+    'Project index: %d units, lists %s + lookup %s. Blame: %d files, %d lines. ' +
+    'DelphiLSP itself runs as a separate process and is NOT included.',
+    [Idx.GlobalUnits, Idx.GlobalIdents, MBText(Idx.GlobalRawBytes),
+     MBText(Idx.GlobalLayerBytes), Idx.ProjectUnits, MBText(Idx.ProjectRawBytes),
+     MBText(Idx.ProjectLayerBytes), BlFiles, BlLines]);
+end;
+
 procedure TStatusFrame.Collect;
 var
   Client: TLspClient;
@@ -264,6 +310,12 @@ begin
       'block gets small - the IDE then reports "out of memory"')
   else
     Row('  address space', '64-bit process', 'not a limiting factor');
+  if not FMemValid or (FTicks mod 10 = 0) then
+  begin
+    FMemText := PluginMemoryText(FMemDetail);
+    FMemValid := True;
+  end;
+  Row('  memory held by this plugin', FMemText, FMemDetail);
   Row('  GDI balance of this plugin', GdiBalanceText,
     'objects our own ticks / paint handlers created and did not release ' +
     'since the IDE started - a number that keeps growing is a leak there');
