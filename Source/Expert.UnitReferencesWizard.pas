@@ -637,9 +637,7 @@ var
   SymbolsJson: TJSONArray;
   I: Integer;
   Sym: TSymbolPos;
-  LspLocations: TArray<TLspLocation>;
-  Loc: TLspLocation;
-  LocPath, LocPathExpanded, LocKey, UpKey: string;
+  LocKey, UpKey: string;
   Lines: TArray<string>;
   Item: TUnitRefItem;
   WasRunning: Boolean;

@@ -2316,7 +2316,6 @@ var
   end;
 
 var
-  Changed: Boolean;
   ImplIdx, DeclIdx: Integer;
   TargetUnit, U: string;
   Needed: TStringList;
@@ -2427,10 +2426,10 @@ begin
       Lines.Insert(EndDotIdx + 2, '');
       Lines.Insert(EndDotIdx + 3, 'end;');
       Lines.Insert(EndDotIdx + 4, '');
-      Changed := True;
     end
     else
     begin
+      var Changed: Boolean;
       // Both the declaration AND the implementation must be rewritten, or
       // the two signatures would disagree and the unit would not compile.
       // If we cannot locate the implementation, change nothing.

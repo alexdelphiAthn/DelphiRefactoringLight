@@ -489,7 +489,7 @@ var
   Ident: string;
   IdentStart: TWithSourcePos;
   BlockDepth: Integer;
-  StartIdx, BodyStartIdx: Integer;
+  BodyStartIdx: Integer;
   StartPos, EndPos, InnerStart, InnerEnd: TWithSourcePos;
   SaveIdx: Integer;
   SaveLine, SaveCol: Integer;
@@ -540,7 +540,6 @@ begin
   SkipTrivia(Cur);
   if Cur.Eof then Exit;
 
-  StartIdx := Cur.Idx;
   StartPos := Cur.Pos;
 
   if IsIdentStart(Cur.Peek) then

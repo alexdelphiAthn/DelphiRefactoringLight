@@ -245,7 +245,7 @@ begin
     H := H * 16777619;
   end;
   // 86% towards the background: readable text stays the main thing.
-  Result := Blend(CommitHues[H mod Length(CommitHues)], ABack, 86);
+  Result := Blend(CommitHues[H mod Cardinal(Length(CommitHues))], ABack, 86);
 end;
 
 // "Sebastian Jänicke" -> "Sebastian": the gutter has room for one word.
