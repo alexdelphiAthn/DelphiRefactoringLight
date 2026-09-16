@@ -1,0 +1,802 @@
+﻿(*
+ * Copyright (c) 2026 Sebastian Jänicke (github.com/jaenicke)
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *)
+unit Expert.DebugConsistency;
+
+// "The debugger does not stop at my breakpoint" / "the debug info does not
+// match the code that runs" (colleagues of the user, 2026-09). Most causes
+// leave traces on disk or in the project options that can be found without
+// a debug session:
+//
+//  * a unit source exists TWICE - the editor shows one copy, the compiler
+//    finds the other one first on the search path;
+//  * a stray precompiled .dcu of a project unit lies in another directory of
+//    the search path, or a unit is only available as .dcu (no source the
+//    compiler can see) while its source is open in the editor;
+//  * line endings that are not CRLF (LF only / mixed, typically after a git
+//    checkout) - the classic reason for breakpoints on the wrong line;
+//  * debug information / local symbols switched off or optimization on,
+//    in the active configuration or by a directive in the source;
+//  * the executable is older than the sources (the last build failed), its
+//    symbol files (.rsm/.tds/.map) do not belong to it, or the debugger
+//    starts a different host application.
+//
+// This unit is PURE (files + an input record, no ToolsAPI) so the console
+// suite can drive it; the IDE side gathers the input.
+
+interface
+
+uses
+  System.SysUtils, System.Generics.Collections;
+
+type
+  TDebugIssueSeverity = (dsInfo, dsWarning, dsProblem);
+  TDebugIssueKind = (dkDuplicateSource, dkStrayDcu, dkDcuOnly, dkLineEndings,
+    dkDebugOption, dkSourceDirective, dkExecutable, dkSymbolFile,
+    dkHostApplication, dkDuplicateBinary);
+
+  TDebugIssue = record
+    Kind: TDebugIssueKind;
+    Severity: TDebugIssueSeverity;
+    FileName: string;   // the file the issue is about
+    Line: Integer;      // 1-based, 0 = not line specific
+    Reason: string;
+    Hint: string;
+    /// <summary>dkLineEndings only: the file can be converted to CRLF.</summary>
+    Fixable: Boolean;
+  end;
+
+  TDebugCheckInput = record
+    ProjectFile: string;               // .dproj
+    ProjectDir: string;
+    /// <summary>Project sources: .dpr/.dpk and all units of the project.</summary>
+    ProjectSources: TArray<string>;
+    /// <summary>Source files open in the editor (any, project or not).</summary>
+    OpenFiles: TArray<string>;
+    /// <summary>Directories the COMPILER searches for units, in its order:
+    ///  project directory, project search path, IDE library path.</summary>
+    UnitSearchDirs: TArray<string>;
+    /// <summary>Directories below which duplicates are NOT reported (the
+    ///  shipped RTL/VCL - it has platform copies by design).</summary>
+    IgnoreDirs: TArray<string>;
+    DcuOutputDir: string;              // '' = next to each source
+    TargetFile: string;                // exe / dll / bpl the build produces
+    HostApplication: string;           // run parameters, '' = the target
+    ConfigName: string;
+    /// <summary>Option values of the active configuration as the project
+    ///  stores them ('' = unknown / not available).</summary>
+    DebugInformation: string;
+    LocalDebugSymbols: string;
+    Optimize: string;
+    /// <summary>Directories Windows searches for DLLs/packages (PATH etc.).</summary>
+    BinarySearchDirs: TArray<string>;
+  end;
+
+  TDebugProgress = reference to function(ACurrent, ATotal: Integer;
+    const AText: string): Boolean;   // False = cancel
+
+/// <summary>Runs all checks. AProgress may be nil.</summary>
+function RunDebugConsistencyCheck(const AInput: TDebugCheckInput;
+  const AProgress: TDebugProgress): TArray<TDebugIssue>;
+
+/// <summary>Counts line breaks in raw file bytes (UTF-16 BOMs handled).</summary>
+procedure CountLineEndings(const ABytes: TBytes; out ACrLf, ALfOnly, ACrOnly: Integer);
+
+/// <summary>Rewrites every line break as CRLF, keeping the encoding (works
+///  on the bytes; UTF-16 by code unit). False when nothing had to change
+///  or the file could not be written.</summary>
+function ConvertFileToCrLf(const AFile: string): Boolean;
+
+type
+  TSourceDirective = record
+    Line: Integer;       // 1-based
+    Text: string;        // e.g. '{$D-}'
+    What: string;        // 'debug information off' ...
+  end;
+
+/// <summary>Compiler directives in AContent that remove or degrade debug
+///  information: {$D-}/{$DEBUGINFO OFF}, {$L-}/{$LOCALSYMBOLS OFF},
+///  {$O+}/{$OPTIMIZATION ON}, also combined forms like {$D-,L-}. Comments
+///  and strings are skipped.</summary>
+function FindDebugDirectives(const AContent: string): TArray<TSourceDirective>;
+
+/// <summary>Include files referenced by {$I name} / {$INCLUDE name} in
+///  AContent (names only, as written).</summary>
+function FindIncludeNames(const AContent: string): TArray<string>;
+
+/// <summary>'true'/'1'/'2' = on, 'false'/'0' = off, '' = unknown.</summary>
+function OptionState(const AValue: string): Integer;   // 1 on, 0 off, -1 unknown
+
+implementation
+
+uses
+  System.Classes, System.IOUtils, System.StrUtils, System.DateUtils;
+
+function OptionState(const AValue: string): Integer;
+var
+  V: string;
+begin
+  V := LowerCase(Trim(AValue));
+  if V = '' then Exit(-1);
+  if (V = 'false') or (V = '0') then Exit(0);
+  if (V = 'true') or (V = '1') or (V = '2') then Exit(1);
+  Result := -1;
+end;
+
+// ---------------------------------------------------------------------------
+//  line endings
+// ---------------------------------------------------------------------------
+
+procedure CountLineEndings(const ABytes: TBytes; out ACrLf, ALfOnly, ACrOnly: Integer);
+var
+  I, N, Step, Start: Integer;
+  BigEndian: Boolean;
+
+  function Unit_(AIdx: Integer): Word;
+  begin
+    if Step = 1 then Exit(ABytes[AIdx]);
+    if BigEndian then
+      Result := (ABytes[AIdx] shl 8) or ABytes[AIdx + 1]
+    else
+      Result := ABytes[AIdx] or (ABytes[AIdx + 1] shl 8);
+  end;
+
+begin
+  ACrLf := 0;
+  ALfOnly := 0;
+  ACrOnly := 0;
+  N := Length(ABytes);
+  Step := 1;
+  Start := 0;
+  BigEndian := False;
+  if (N >= 2) and (ABytes[0] = $FF) and (ABytes[1] = $FE) then
+  begin
+    Step := 2;
+    Start := 2;
+  end
+  else if (N >= 2) and (ABytes[0] = $FE) and (ABytes[1] = $FF) then
+  begin
+    Step := 2;
+    Start := 2;
+    BigEndian := True;
+  end;
+  I := Start;
+  while I + Step - 1 < N do
+  begin
+    case Unit_(I) of
+      13:
+        if (I + 2 * Step - 1 < N) and (Unit_(I + Step) = 10) then
+        begin
+          Inc(ACrLf);
+          Inc(I, Step);
+        end
+        else
+          Inc(ACrOnly);
+      10:
+        Inc(ALfOnly);
+    end;
+    Inc(I, Step);
+  end;
+end;
+
+function ConvertFileToCrLf(const AFile: string): Boolean;
+var
+  Src, Dst: TBytes;
+  N, I, J, Step, Start: Integer;
+  BigEndian: Boolean;
+  CrLf, LfOnly, CrOnly: Integer;
+
+  function U(AIdx: Integer): Word;
+  begin
+    if Step = 1 then Exit(Src[AIdx]);
+    if BigEndian then
+      Result := (Src[AIdx] shl 8) or Src[AIdx + 1]
+    else
+      Result := Src[AIdx] or (Src[AIdx + 1] shl 8);
+  end;
+
+  procedure Put(AValue: Word);
+  begin
+    if Step = 1 then
+    begin
+      Dst[J] := Byte(AValue);
+      Inc(J);
+    end
+    else if BigEndian then
+    begin
+      Dst[J] := Byte(AValue shr 8);
+      Dst[J + 1] := Byte(AValue);
+      Inc(J, 2);
+    end
+    else
+    begin
+      Dst[J] := Byte(AValue);
+      Dst[J + 1] := Byte(AValue shr 8);
+      Inc(J, 2);
+    end;
+  end;
+
+begin
+  Result := False;
+  try
+    Src := TFile.ReadAllBytes(AFile);
+  except
+    Exit;
+  end;
+  CountLineEndings(Src, CrLf, LfOnly, CrOnly);
+  if LfOnly + CrOnly = 0 then Exit;
+  N := Length(Src);
+  Step := 1;
+  Start := 0;
+  BigEndian := False;
+  if (N >= 2) and (Src[0] = $FF) and (Src[1] = $FE) then
+  begin
+    Step := 2; Start := 2;
+  end
+  else if (N >= 2) and (Src[0] = $FE) and (Src[1] = $FF) then
+  begin
+    Step := 2; Start := 2; BigEndian := True;
+  end;
+  SetLength(Dst, N + (LfOnly + CrOnly) * Step);
+  J := 0;
+  for I := 0 to Start - 1 do
+  begin
+    Dst[J] := Src[I];
+    Inc(J);
+  end;
+  I := Start;
+  while I + Step - 1 < N do
+  begin
+    case U(I) of
+      13:
+        begin
+          Put(13);
+          Put(10);
+          if (I + 2 * Step - 1 < N) and (U(I + Step) = 10) then Inc(I, Step);
+        end;
+      10:
+        begin
+          Put(13);
+          Put(10);
+        end;
+    else
+      Put(U(I));
+    end;
+    Inc(I, Step);
+  end;
+  // an odd trailing byte of a broken UTF-16 file stays as it was
+  while I < N do
+  begin
+    Dst[J] := Src[I];
+    Inc(J);
+    Inc(I);
+  end;
+  SetLength(Dst, J);
+  try
+    TFile.WriteAllBytes(AFile, Dst);
+    Result := True;
+  except
+    Result := False;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+//  directives
+// ---------------------------------------------------------------------------
+
+// Walks AContent and hands every "{$...}" / "(*$...*)" directive body
+// (without the braces) with its 1-based line to AProc. Comments ({ } (* *)
+// //) and string literals are skipped.
+procedure ForEachDirective(const AContent: string;
+  const AProc: TProc<Integer, string, string>);
+var
+  I, N, Line, StartLine: Integer;
+  C: Char;
+begin
+  N := Length(AContent);
+  I := 1;
+  Line := 1;
+  while I <= N do
+  begin
+    C := AContent[I];
+    if C = #10 then
+    begin
+      Inc(Line);
+      Inc(I);
+      Continue;
+    end;
+    if C = '''' then
+    begin
+      Inc(I);
+      while (I <= N) and not CharInSet(AContent[I], ['''', #10]) do Inc(I);
+      Inc(I);
+      Continue;
+    end;
+    if (C = '/') and (I < N) and (AContent[I + 1] = '/') then
+    begin
+      while (I <= N) and (AContent[I] <> #10) do Inc(I);
+      Continue;
+    end;
+    if (C = '{') or ((C = '(') and (I < N) and (AContent[I + 1] = '*')) then
+    begin
+      var Paren := C = '(';
+      var Open := I;
+      StartLine := Line;
+      if Paren then Inc(I, 2) else Inc(I);
+      var BodyStart := I;
+      while I <= N do
+      begin
+        if AContent[I] = #10 then Inc(Line);
+        if (not Paren) and (AContent[I] = '}') then Break;
+        if Paren and (AContent[I] = '*') and (I < N) and (AContent[I + 1] = ')') then Break;
+        Inc(I);
+      end;
+      if (BodyStart <= N) and (AContent[BodyStart] = '$') then
+      begin
+        var Body := Copy(AContent, BodyStart + 1, I - BodyStart - 1);
+        var Full: string;
+        if Paren then
+          Full := Copy(AContent, Open, I - Open + 2)
+        else
+          Full := Copy(AContent, Open, I - Open + 1);
+        AProc(StartLine, Body, Full);
+      end;
+      if Paren then Inc(I, 2) else Inc(I);
+      Continue;
+    end;
+    Inc(I);
+  end;
+end;
+
+function FindDebugDirectives(const AContent: string): TArray<TSourceDirective>;
+var
+  Found: TList<TSourceDirective>;
+begin
+  Found := TList<TSourceDirective>.Create;
+  try
+    ForEachDirective(AContent,
+      procedure(ALine: Integer; ABody, AFull: string)
+      var
+        D: TSourceDirective;
+        U, Name, Value: string;
+        SpaceP: Integer;
+      begin
+        U := UpperCase(Trim(ABody));
+        // long form: "DEBUGINFO OFF", "LOCALSYMBOLS OFF", "OPTIMIZATION ON"
+        SpaceP := Pos(' ', U);
+        if SpaceP > 0 then
+        begin
+          Name := Copy(U, 1, SpaceP - 1);
+          Value := Trim(Copy(U, SpaceP + 1, MaxInt));
+          D.Line := ALine;
+          D.Text := AFull;
+          D.What := '';
+          if (Name = 'DEBUGINFO') and StartsStr('OFF', Value) then
+            D.What := 'debug information off'
+          else if (Name = 'LOCALSYMBOLS') and StartsStr('OFF', Value) then
+            D.What := 'local symbols off'
+          else if (Name = 'OPTIMIZATION') and StartsStr('ON', Value) then
+            D.What := 'optimization on';
+          if D.What <> '' then Found.Add(D);
+          Exit;
+        end;
+        // short, possibly combined form: "D-", "D-,L-", "O+,W-"
+        for var Part in U.Split([',']) do
+        begin
+          var P := Trim(Part);
+          if Length(P) <> 2 then Continue;
+          D.Line := ALine;
+          D.Text := AFull;
+          D.What := '';
+          if P = 'D-' then D.What := 'debug information off'
+          else if P = 'L-' then D.What := 'local symbols off'
+          else if P = 'O+' then D.What := 'optimization on';
+          if D.What <> '' then Found.Add(D);
+        end;
+      end);
+    Result := Found.ToArray;
+  finally
+    Found.Free;
+  end;
+end;
+
+function FindIncludeNames(const AContent: string): TArray<string>;
+var
+  Found: TList<string>;
+begin
+  Found := TList<string>.Create;
+  try
+    ForEachDirective(AContent,
+      procedure(ALine: Integer; ABody, AFull: string)
+      var
+        B, U, Name: string;
+      begin
+        B := Trim(ABody);
+        U := UpperCase(B);
+        if StartsStr('INCLUDE ', U) then
+          Name := Trim(Copy(B, 9, MaxInt))
+        else if StartsStr('I ', U) then
+          Name := Trim(Copy(B, 3, MaxInt))
+        else
+          Exit;
+        // "{$I+}" / "{$I-}" is I/O checking, not an include
+        if (Name = '') or (Name = '+') or (Name = '-') then Exit;
+        if (Length(Name) >= 2) and (Name[1] = '''') and (Name[Length(Name)] = '''') then
+          Name := Copy(Name, 2, Length(Name) - 2);
+        Found.Add(Name);
+      end);
+    Result := Found.ToArray;
+  finally
+    Found.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+//  the check
+// ---------------------------------------------------------------------------
+
+function NormDir(const ADir: string): string;
+begin
+  Result := ExcludeTrailingPathDelimiter(TPath.GetFullPath(ADir));
+end;
+
+function IsBelow(const AFile: string; const ADirs: TArray<string>): Boolean;
+begin
+  for var D in ADirs do
+    if (D <> '') and StartsText(IncludeTrailingPathDelimiter(D), AFile) then
+      Exit(True);
+  Result := False;
+end;
+
+function FileTime(const AFile: string): TDateTime;
+begin
+  try
+    Result := TFile.GetLastWriteTime(AFile);
+  except
+    Result := 0;
+  end;
+end;
+
+function TimeText(const AFile: string): string;
+begin
+  Result := FormatDateTime('yyyy-mm-dd hh:nn', FileTime(AFile));
+end;
+
+function RunDebugConsistencyCheck(const AInput: TDebugCheckInput;
+  const AProgress: TDebugProgress): TArray<TDebugIssue>;
+var
+  Issues: TList<TDebugIssue>;
+  SearchDirs, IgnoreDirs: TArray<string>;
+  Sources: TDictionary<string, string>;   // UPPER unit name -> project source path
+  Checked: TDictionary<string, Boolean>;  // files already line-checked
+  Step, Total: Integer;
+  Cancelled: Boolean;
+
+  procedure Add(AKind: TDebugIssueKind; ASev: TDebugIssueSeverity;
+    const AFile: string; ALine: Integer; const AReason, AHint: string;
+    AFixable: Boolean = False);
+  var
+    I: TDebugIssue;
+  begin
+    I.Kind := AKind;
+    I.Severity := ASev;
+    I.FileName := AFile;
+    I.Line := ALine;
+    I.Reason := AReason;
+    I.Hint := AHint;
+    I.Fixable := AFixable;
+    Issues.Add(I);
+  end;
+
+  function Tick(const AText: string): Boolean;
+  begin
+    Inc(Step);
+    if Assigned(AProgress) and not AProgress(Step, Total, AText) then
+      Cancelled := True;
+    Result := not Cancelled;
+  end;
+
+  // first directory of the compiler's search order holding AFileName
+  function FirstOnSearchPath(const AFileName: string): string;
+  begin
+    for var D in SearchDirs do
+      if TFile.Exists(TPath.Combine(D, AFileName)) then
+        Exit(TPath.Combine(D, AFileName));
+    Result := '';
+  end;
+
+  procedure CheckLineEndings(const AFile: string; AOpen: Boolean);
+  var
+    Bytes: TBytes;
+    CrLf, Lf, Cr: Integer;
+  begin
+    if Checked.ContainsKey(UpperCase(AFile)) then Exit;
+    Checked.Add(UpperCase(AFile), True);
+    if not TFile.Exists(AFile) then Exit;
+    try
+      Bytes := TFile.ReadAllBytes(AFile);
+    except
+      Exit;
+    end;
+    CountLineEndings(Bytes, CrLf, Lf, Cr);
+    if Lf + Cr = 0 then Exit;
+    var Hint := 'the debugger maps breakpoints by CRLF lines - convert the file to CRLF ' +
+      '(and check git''s core.autocrlf / .gitattributes, or it comes back)';
+    if AOpen then
+      Hint := Hint + '. The file is open in the editor: close it before converting';
+    if CrLf = 0 then
+      Add(dkLineEndings, dsProblem, AFile, 0,
+        Format('line endings are LF only (%d lines)', [Lf + Cr]), Hint, not AOpen)
+    else
+      Add(dkLineEndings, dsProblem, AFile, 0,
+        Format('mixed line endings: %d CRLF, %d LF only, %d CR only', [CrLf, Lf, Cr]),
+        Hint, not AOpen);
+  end;
+
+  function IsOpen(const AFile: string): Boolean;
+  begin
+    for var F in AInput.OpenFiles do
+      if SameText(F, AFile) then Exit(True);
+    Result := False;
+  end;
+
+  procedure CheckDirectivesAndIncludes(const AFile: string);
+  var
+    Content: string;
+  begin
+    try
+      Content := TFile.ReadAllText(AFile);
+    except
+      Exit;
+    end;
+    for var D in FindDebugDirectives(Content) do
+      Add(dkSourceDirective, dsWarning, AFile, D.Line,
+        Format('%s turns %s', [D.Text, D.What]),
+        'breakpoints in code compiled this way do not bind or jump around ' +
+        '- remove the directive or limit it to release builds ({$IFDEF DEBUG})');
+    for var Name in FindIncludeNames(Content) do
+    begin
+      var Inc_ := '';
+      var Candidates: TArray<string> := [TPath.Combine(ExtractFilePath(AFile), Name)];
+      if ExtractFileExt(Name) = '' then
+        Candidates := Candidates + [TPath.Combine(ExtractFilePath(AFile), Name + '.inc')];
+      for var C in Candidates do
+        if TFile.Exists(C) then
+        begin
+          Inc_ := C;
+          Break;
+        end;
+      if Inc_ = '' then
+      begin
+        Inc_ := FirstOnSearchPath(Name);
+        if (Inc_ = '') and (ExtractFileExt(Name) = '') then
+          Inc_ := FirstOnSearchPath(Name + '.inc');
+      end;
+      if (Inc_ <> '') and not IsBelow(Inc_, IgnoreDirs) then
+        CheckLineEndings(TPath.GetFullPath(Inc_), IsOpen(Inc_));
+    end;
+  end;
+
+begin
+  Issues := TList<TDebugIssue>.Create;
+  Sources := TDictionary<string, string>.Create;
+  Checked := TDictionary<string, Boolean>.Create;
+  try
+    Step := 0;
+    Cancelled := False;
+    Total := Length(AInput.ProjectSources) * 2 + Length(AInput.OpenFiles) + 4;
+
+    SearchDirs := nil;
+    for var D in AInput.UnitSearchDirs do
+      if (Trim(D) <> '') and TDirectory.Exists(D) then
+        SearchDirs := SearchDirs + [NormDir(D)];
+    IgnoreDirs := nil;
+    for var D in AInput.IgnoreDirs do
+      if Trim(D) <> '' then IgnoreDirs := IgnoreDirs + [NormDir(D)];
+
+    for var S in AInput.ProjectSources do
+      if SameText(ExtractFileExt(S), '.pas') then
+        Sources.AddOrSetValue(UpperCase(ChangeFileExt(ExtractFileName(S), '')), S);
+
+    // ---- 1. duplicate sources and stray DCUs of project units ---------------
+    for var S in AInput.ProjectSources do
+    begin
+      if not Tick('search path: ' + ExtractFileName(S)) then Break;
+      if not SameText(ExtractFileExt(S), '.pas') then Continue;
+      var UnitFile := ExtractFileName(S);
+      var DcuFile := ChangeFileExt(UnitFile, '.dcu');
+      for var D in SearchDirs do
+      begin
+        if IsBelow(D + PathDelim, IgnoreDirs) then Continue;
+        var Other := TPath.Combine(D, UnitFile);
+        if TFile.Exists(Other) and not SameText(TPath.GetFullPath(Other), TPath.GetFullPath(S)) then
+          Add(dkDuplicateSource, dsWarning, Other, 0,
+            Format('second copy of project unit %s (project uses %s)', [UnitFile, S]),
+            'opening this copy (e.g. via "find declaration") shows code that is NOT ' +
+            'compiled - breakpoints set there never bind. Delete or rename one copy');
+        var Dcu := TPath.Combine(D, DcuFile);
+        var OwnDcuDir := AInput.DcuOutputDir;
+        if OwnDcuDir = '' then OwnDcuDir := ExtractFilePath(S);
+        if TFile.Exists(Dcu) and not SameText(NormDir(D), NormDir(OwnDcuDir)) then
+          Add(dkStrayDcu, dsWarning, Dcu, 0,
+            Format('precompiled %s from %s outside the project''s DCU output directory',
+              [DcuFile, TimeText(Dcu)]),
+            'a unit compiled elsewhere can be linked instead of the project''s own ' +
+            '(different code, different or no debug info) - delete the stray .dcu');
+      end;
+    end;
+
+    // ---- 2. open files the compiler does not take from where they are ------
+    for var F in AInput.OpenFiles do
+    begin
+      if Cancelled or not Tick('open file: ' + ExtractFileName(F)) then Break;
+      if not SameText(ExtractFileExt(F), '.pas') then Continue;
+      if IsBelow(F, IgnoreDirs) then Continue;
+      var UnitKey := UpperCase(ChangeFileExt(ExtractFileName(F), ''));
+      var ProjectCopy: string;
+      if Sources.TryGetValue(UnitKey, ProjectCopy) then
+      begin
+        if not SameText(TPath.GetFullPath(ProjectCopy), TPath.GetFullPath(F)) then
+          Add(dkDuplicateSource, dsProblem, F, 0,
+            Format('this copy is open, but the project compiles %s', [ProjectCopy]),
+            'breakpoints in this editor tab never bind - close it and open the ' +
+            'project''s copy');
+        Continue;
+      end;
+      // not a project unit: which copy does the compiler find?
+      var Compiled := FirstOnSearchPath(ExtractFileName(F));
+      if Compiled <> '' then
+      begin
+        if not SameText(TPath.GetFullPath(Compiled), TPath.GetFullPath(F)) then
+          Add(dkDuplicateSource, dsProblem, F, 0,
+            Format('the compiler takes %s from the search path, not this copy', [Compiled]),
+            'breakpoints in this editor tab never bind - open the copy the compiler uses, ' +
+            'or fix the search path order');
+      end
+      else
+      begin
+        var Dcu := FirstOnSearchPath(ChangeFileExt(ExtractFileName(F), '.dcu'));
+        if Dcu <> '' then
+          Add(dkDcuOnly, dsWarning, F, 0,
+            Format('the compiler does not see this source - it links the precompiled %s (%s)',
+              [Dcu, TimeText(Dcu)]),
+            'breakpoints bind only if that .dcu was built from exactly this source WITH ' +
+            'debug information. To debug it, add the source directory to the project ' +
+            'search path (or rebuild the library in debug mode)');
+      end;
+    end;
+
+    // ---- 3. line endings, directives, include files -------------------------
+    for var S in AInput.ProjectSources do
+    begin
+      if Cancelled or not Tick('line endings: ' + ExtractFileName(S)) then Break;
+      CheckLineEndings(TPath.GetFullPath(S), IsOpen(S));
+      CheckDirectivesAndIncludes(S);
+    end;
+    for var F in AInput.OpenFiles do
+      if not IsBelow(F, IgnoreDirs) and (SameText(ExtractFileExt(F), '.pas')
+        or SameText(ExtractFileExt(F), '.inc')) then
+        CheckLineEndings(TPath.GetFullPath(F), True);
+
+    // ---- 4. options of the active configuration -----------------------------
+    if not Cancelled and Tick('project options') then
+    begin
+      var Cfg := AInput.ConfigName;
+      if Cfg = '' then Cfg := 'active configuration';
+      if OptionState(AInput.DebugInformation) = 0 then
+        Add(dkDebugOption, dsProblem, AInput.ProjectFile, 0,
+          Format('"%s": debug information is switched off', [Cfg]),
+          'Project > Options > Building > Delphi Compiler > Compiling > Debug information');
+      if OptionState(AInput.LocalDebugSymbols) = 0 then
+        Add(dkDebugOption, dsWarning, AInput.ProjectFile, 0,
+          Format('"%s": local symbols are switched off', [Cfg]),
+          'local variables cannot be inspected - Project > Options > Compiling > Local symbols');
+      if OptionState(AInput.Optimize) = 1 then
+        Add(dkDebugOption, dsWarning, AInput.ProjectFile, 0,
+          Format('"%s": optimization is switched on', [Cfg]),
+          'optimized code merges and drops lines - breakpoints jump or are ignored, ' +
+          'variables show "inaccessible". Switch it off for debugging');
+    end;
+
+    // ---- 5. target and symbol files -----------------------------------------
+    if not Cancelled and Tick('target') and (AInput.TargetFile <> '') then
+    begin
+      if not TFile.Exists(AInput.TargetFile) then
+        Add(dkExecutable, dsInfo, AInput.TargetFile, 0, 'the target does not exist yet',
+          'build the project')
+      else
+      begin
+        var TargetTime := FileTime(AInput.TargetFile);
+        var Newest := '';
+        var NewestTime: TDateTime := 0;
+        for var S in AInput.ProjectSources do
+        begin
+          var T := FileTime(S);
+          if T > NewestTime then
+          begin
+            NewestTime := T;
+            Newest := S;
+          end;
+        end;
+        if (Newest <> '') and (NewestTime > IncSecond(TargetTime, 2)) then
+          Add(dkExecutable, dsProblem, AInput.TargetFile, 0,
+            Format('built %s, but %s was changed later (%s)',
+              [TimeText(AInput.TargetFile), ExtractFileName(Newest), TimeText(Newest)]),
+            'the running code is older than the source - did the last build fail? ' +
+            'Build (not just run) and check the Messages window');
+        for var Ext in ['.rsm', '.tds', '.map'] do
+        begin
+          var Sym := ChangeFileExt(AInput.TargetFile, Ext);
+          if TFile.Exists(Sym) and (Abs(SecondsBetween(FileTime(Sym), TargetTime)) > 300) then
+            Add(dkSymbolFile, dsWarning, Sym, 0,
+              Format('symbol file from %s does not belong to the target from %s',
+                [TimeText(Sym), TimeText(AInput.TargetFile)]),
+              'stale symbol files make the debugger show wrong lines/variables - ' +
+              'delete it and rebuild');
+        end;
+      end;
+
+      if (AInput.HostApplication <> '')
+        and not SameText(TPath.GetFullPath(AInput.HostApplication), TPath.GetFullPath(AInput.TargetFile)) then
+      begin
+        var IsExe := SameText(ExtractFileExt(AInput.TargetFile), '.exe');
+        if IsExe then
+          Add(dkHostApplication, dsProblem, AInput.HostApplication, 0,
+            Format('Run > Parameters starts %s instead of the built %s',
+              [AInput.HostApplication, ExtractFileName(AInput.TargetFile)]),
+            'breakpoints in this project bind only if that program loads the code ' +
+            'built here - clear the host application for an exe project')
+        else
+        begin
+          Add(dkHostApplication, dsInfo, AInput.HostApplication, 0,
+            Format('the debugger starts the host %s, which must load %s',
+              [AInput.HostApplication, AInput.TargetFile]),
+            'make sure the host loads THIS file and not a copy from its own directory or the PATH');
+          if not TFile.Exists(AInput.HostApplication) then
+            Add(dkHostApplication, dsProblem, AInput.HostApplication, 0,
+              'the host application does not exist', 'Run > Parameters > Host application');
+        end;
+      end;
+    end;
+
+    // ---- 6. copies of a DLL / package target where Windows may load them ----
+    if not Cancelled and Tick('binaries') and (AInput.TargetFile <> '')
+      and not SameText(ExtractFileExt(AInput.TargetFile), '.exe') then
+    begin
+      var Name := ExtractFileName(AInput.TargetFile);
+      var Dirs := AInput.BinarySearchDirs;
+      if AInput.HostApplication <> '' then
+        Dirs := [ExtractFilePath(AInput.HostApplication)] + Dirs;
+      var Seen := TDictionary<string, Boolean>.Create;
+      try
+        for var D in Dirs do
+        begin
+          if Trim(D) = '' then Continue;
+          var Cand := TPath.Combine(D, Name);
+          var Key := UpperCase(TPath.GetFullPath(Cand));
+          if Seen.ContainsKey(Key) then Continue;
+          Seen.Add(Key, True);
+          if TFile.Exists(Cand) and not SameText(TPath.GetFullPath(Cand), TPath.GetFullPath(AInput.TargetFile)) then
+            Add(dkDuplicateBinary, dsWarning, Cand, 0,
+              Format('another %s (%s) where Windows looks for it', [Name, TimeText(Cand)]),
+              'if the host loads this copy, your breakpoints never bind - delete it or ' +
+              'make the host load the built file');
+        end;
+      finally
+        Seen.Free;
+      end;
+    end;
+
+    Result := Issues.ToArray;
+  finally
+    Checked.Free;
+    Sources.Free;
+    Issues.Free;
+  end;
+end;
+
+end.

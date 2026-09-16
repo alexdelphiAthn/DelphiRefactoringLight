@@ -113,6 +113,8 @@ contains
   Expert.MessagesReader in '..\Source\Expert.MessagesReader.pas',
   Expert.StatusWindow in '..\Source\Expert.StatusWindow.pas',
   Expert.FindOriginalSymbolWizard in '..\Source\Expert.FindOriginalSymbolWizard.pas',
-  Expert.UsesCleanup in '..\Source\Expert.UsesCleanup.pas';
+  Expert.UsesCleanup in '..\Source\Expert.UsesCleanup.pas',
+  Expert.DebugConsistency in '..\Source\Expert.DebugConsistency.pas',
+  Expert.DebugConsistencyDialog in '..\Source\Expert.DebugConsistencyDialog.pas';
 
 end.
