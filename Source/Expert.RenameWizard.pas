@@ -109,9 +109,8 @@ type
       const AOldName, ANewName: string): TLspWorkspaceEdit;
 
     function FindCandidates(const AOldName: string; const AFiles: TArray<string>): TArray<TRenameCandidate>;
-    function VerifyWithLsp(const ACandidates: TArray<TRenameCandidate>; const AOldName, ANewName, ADefFilePath: string;
-      const AImplFiles: TArray<string>; AClient: TLspClient): TLspWorkspaceEdit;
-    function IsInStringOrComment(const ALine: string; APos: Integer): Boolean;
+    function VerifyWithLsp(const ACandidates: TArray<TRenameCandidate>; const AOldName, ANewName: string;
+      const ATargets: TLspSymbolTargets; AClient: TLspClient): TLspWorkspaceEdit;
 
     /// <summary>Finds interface/class method implementations via a
     ///  text + syntax scan over all project files. Returns candidates
@@ -166,7 +165,6 @@ var
 
 implementation
 
-{$IFNDEF STANDALONE_BUILD}
 // True when the identifier at (ALine0, ACol0) directly follows a declaring
 // keyword - 'procedure X', 'class function X', 'constructor X',
 // 'destructor X', 'property X' - i.e. the caret is ON a declaration.
@@ -195,6 +193,7 @@ begin
       Exit(True);
 end;
 
+{$IFNDEF STANDALONE_BUILD}
 { TLspRenameWizard - IOTANotifier / IOTAWizard / IOTAMenuWizard stubs.
   Only compiled into the IDE plugin; the standalone build does not
   inherit from TNotifierObject and never needs these. }
@@ -1141,7 +1140,47 @@ begin
       FHost.SetStatus(Format('%d candidate(s). Verifying...', [Length(Candidates)]));
 
       ImplFilesArray := ImplFilesList.ToArray;
-      FEdit := VerifyWithLsp(Candidates, FContext.WordAtCursor, NewName, DefFilePath, ImplFilesArray, Client);
+      // The symbol's own positions: its declaration + implementation, and
+      // those of every implementing class (interface / virtual methods).
+      var Targets: TLspSymbolTargets;
+      if Length(DefLocs) > 0 then
+        Targets.AddWithPartner(Client, DefFilePath, DefLine, DefCol)
+      else
+        Targets.AddWithPartner(Client, FContext.FileName, LspLine, LspCol);
+      // The implementation scan is for OTHER types (interface implementers,
+      // overrides in descendants). A header of the OWNER type itself that is
+      // not the symbol already is a sibling OVERLOAD - forum report: renaming
+      // Init(const xBoolean: Boolean) also renamed the parameterless Init.
+      var ImplLinesOf := TDictionary<string, TArray<string>>.Create;
+      try
+        for var IC in ImplCandidates do
+        begin
+          var ICLines: TArray<string>;
+          if not ImplLinesOf.TryGetValue(UpperCase(IC.FilePath), ICLines) then
+          begin
+            try
+              ICLines := ReadDelphiFileLines(IC.FilePath);
+            except
+              ICLines := nil;
+            end;
+            ImplLinesOf.Add(UpperCase(IC.FilePath), ICLines);
+          end;
+          if (OwnerType <> '') and (IC.Line >= 0) and (IC.Line <= High(ICLines))
+            and SameText(TImplementationFinder.OwnerTypeFromImplLine(ICLines[IC.Line]), OwnerType)
+            and not Targets.Contains(IC.FilePath, IC.Line) then
+          begin
+            FDiagLog := FDiagLog + 'Sibling overload skipped: ' +
+              ExtractFileName(IC.FilePath) + ':' + IntToStr(IC.Line + 1) + sLineBreak;
+            Continue;
+          end;
+          Targets.AddWithPartner(Client, IC.FilePath, IC.Line, IC.Col);
+        end;
+      finally
+        ImplLinesOf.Free;
+      end;
+      FDiagLog := FDiagLog + 'Symbol positions (' + IntToStr(Targets.Count) + '):' +
+        sLineBreak + Targets.Text + sLineBreak;
+      FEdit := VerifyWithLsp(Candidates, FContext.WordAtCursor, NewName, Targets, Client);
     finally
       ImplFilesList.Free;
     end;
@@ -1226,42 +1265,13 @@ end;
 
 { Helper functions }
 
-function TLspRenameWizard.IsInStringOrComment(const ALine: string; APos: Integer): Boolean;
-var
-  I: Integer;
-  InString: Boolean;
-begin
-  Result := False;
-  for I := 1 to APos - 1 do
-    if (I < Length(ALine)) and (ALine[I] = '/') and (ALine[I + 1] = '/') then
-      Exit(True);
-  var BraceDepth := 0;
-  for I := 1 to APos - 1 do
-  begin
-    if ALine[I] = '{' then Inc(BraceDepth)
-    else if ALine[I] = '}' then Dec(BraceDepth);
-  end;
-  if BraceDepth > 0 then Exit(True);
-  var PSDepth := 0;
-  for I := 1 to APos - 2 do
-  begin
-    if (ALine[I] = '(') and (ALine[I+1] = '*') then Inc(PSDepth)
-    else if (ALine[I] = '*') and (ALine[I+1] = ')') then Dec(PSDepth);
-  end;
-  if PSDepth > 0 then Exit(True);
-  InString := False;
-  for I := 1 to APos - 1 do
-    if ALine[I] = '''' then InString := not InString;
-  if InString then Exit(True);
-end;
-
 { Text search }
 
 function TLspRenameWizard.FindCandidates(const AOldName: string; const AFiles: TArray<string>): TArray<TRenameCandidate>;
 var
   CandidateList: TList<TRenameCandidate>;
   F, Line, RawContent: string;
-  Lines: TArray<string>;
+  Lines, Masked: TArray<string>;
   UpperOldName: string;
   LineIdx, SearchPos, FoundPos, AfterPos: Integer;
   BeforeOk, AfterOk: Boolean;
@@ -1283,6 +1293,8 @@ begin
         RawContent := ReadDelphiFile(F);
         if Pos(UpperOldName, UpperCase(RawContent)) = 0 then Continue;
         Lines := ReadDelphiFileLines(F);
+        // comment/string state carried ACROSS lines (multi-line { })
+        Masked := MaskCommentsAndStrings(Lines);
       except
         Continue;
       end;
@@ -1303,7 +1315,7 @@ begin
           AfterOk := (AfterPos > Length(Line)) or
             not CharInSet(Line[AfterPos], ['A'..'Z','a'..'z','0'..'9','_']);
 
-          if BeforeOk and AfterOk and not IsInStringOrComment(Line, FoundPos) then
+          if BeforeOk and AfterOk and (Masked[LineIdx][FoundPos] = Line[FoundPos]) then
           begin
             Candidate.FilePath := F;
             Candidate.Line := LineIdx;
@@ -1535,17 +1547,7 @@ end;
 { LSP verification }
 
 function TLspRenameWizard.VerifyWithLsp(const ACandidates: TArray<TRenameCandidate>;
-  const AOldName, ANewName, ADefFilePath: string; const AImplFiles: TArray<string>; AClient: TLspClient): TLspWorkspaceEdit;
-
-  /// <summary>Checks whether APath is one of the impl files.</summary>
-  function IsImplFile(const APath: string): Boolean;
-  begin
-    Result := False;
-    for var F in AImplFiles do
-      if SameText(ExpandFileName(APath), ExpandFileName(F)) then
-        Exit(True);
-  end;
-
+  const AOldName, ANewName: string; const ATargets: TLspSymbolTargets; AClient: TLspClient): TLspWorkspaceEdit;
 var
   FileMap: TDictionary<string, TList<TLspTextEdit>>;
   LastOpenedFile: string;
@@ -1583,46 +1585,29 @@ begin
       try
         var Defs := AClient.GotoDefinition(C.FilePath, C.Line, C.Col);
 
-        if Length(Defs) = 0 then
+        // The candidate IS one of the symbol's positions (declaration /
+        // implementation of the symbol or of an implementing class - see
+        // TLspSymbolTargets), or DelphiLSP takes it to one of them. The
+        // FILE alone is not enough: with several same-named methods in one
+        // unit, every one of them was renamed (forum report 2026-09).
+        if ATargets.Contains(C.FilePath, C.Line) then
         begin
-          // Null: either on the declaration itself, or LSP cannot
-          // resolve. We accept if the candidate lies in the interface
-          // file or in a known impl file.
-          if SameText(ExpandFileName(C.FilePath), ExpandFileName(ADefFilePath)) then
-          begin
-            Matches := True;
-            DiagLine := DiagLine + 'null -> MATCH (declaration file)';
-          end
-          else if IsImplFile(C.FilePath) then
-          begin
-            Matches := True;
-            DiagLine := DiagLine + 'null -> MATCH (impl file)';
-          end
-          else
-            DiagLine := DiagLine + 'null -> SKIP';
+          Matches := True;
+          DiagLine := DiagLine + '(symbol position) -> MATCH';
         end
+        else if Length(Defs) = 0 then
+          DiagLine := DiagLine + 'null -> SKIP'
         else
         begin
           var DefPath := TLspUri.FileUriToPath(Defs[0].Uri);
           DiagLine := DiagLine + ExtractFileName(DefPath) + ':' + IntToStr(Defs[0].Range.Start.Line + 1);
-          if SameText(ExpandFileName(DefPath), ExpandFileName(ADefFilePath)) then
+          if ATargets.Contains(DefPath, Defs[0].Range.Start.Line) then
           begin
             Matches := True;
             DiagLine := DiagLine + ' -> MATCH';
           end
-          else if IsImplFile(DefPath) then
-          begin
-            // DelphiLSP resolves class-bound positions (class method decl,
-            // calls via class variable, impl body) to the class level
-            // rather than the interface level. If the target lies in one
-            // of our known impl files, the candidate is a valid reference
-            // point for the interface method.
-            Matches := True;
-            DiagLine := DiagLine + ' -> MATCH (impl file)';
-          end
           else
-            DiagLine := DiagLine + ' -> SKIP (expected: ' +
-              ExtractFileName(ADefFilePath) + ')';
+            DiagLine := DiagLine + ' -> SKIP (another symbol)';
         end;
       except
         on E: Exception do

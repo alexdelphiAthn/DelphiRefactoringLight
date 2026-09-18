@@ -244,6 +244,16 @@ function ExpandIncludeDirectives(const AText, ABaseDir: string;
 ///  symbol when the LSP has no definition for it (index fallback).</summary>
 function FindDeclarationLine(const AContent, AIdent: string): Integer;
 
+/// <summary>ALines with every character inside a comment ({ }, (* *), //)
+///  or a string literal replaced by a blank - line count and every line's
+///  LENGTH unchanged, so positions stay valid. The comment state is carried
+///  ACROSS lines: a word on the 3rd line of a multi-line { ... } comment is
+///  masked (the old per-line check only looked at the line itself and took
+///  it for code - Find References / Rename then listed it, forum report
+///  2026-09). A character is code exactly when Masked[L][C] = ALines[L][C]
+///  for a non-blank character.</summary>
+function MaskCommentsAndStrings(const ALines: TArray<string>): TArray<string>;
+
 /// <summary>0-based line range of the routine that CONTAINS ALine0 -
 ///  from its header (procedure/function/constructor/destructor, including
 ///  a qualified or generic one) to its final "end;". False when the line
@@ -1323,6 +1333,86 @@ begin
   finally
     EnvVars.Free;
     Dirs.Free;
+  end;
+end;
+
+function MaskCommentsAndStrings(const ALines: TArray<string>): TArray<string>;
+var
+  Block: Integer;   // 0 code, 1 inside { }, 2 inside (* *)
+begin
+  SetLength(Result, Length(ALines));
+  Block := 0;
+  for var L := 0 to High(ALines) do
+  begin
+    var S := ALines[L];
+    var M := S;   // copy-on-write: only lines with comments get a new string
+    var N := Length(S);
+    var I := 1;
+    var InStr := False;   // Delphi string literals never span lines
+    while I <= N do
+    begin
+      if Block = 1 then
+      begin
+        if S[I] = '}' then Block := 0;
+        M[I] := ' ';
+        Inc(I);
+        Continue;
+      end;
+      if Block = 2 then
+      begin
+        if (S[I] = '*') and (I < N) and (S[I + 1] = ')') then
+        begin
+          M[I] := ' '; M[I + 1] := ' ';
+          Block := 0;
+          Inc(I, 2);
+          Continue;
+        end;
+        M[I] := ' ';
+        Inc(I);
+        Continue;
+      end;
+      if InStr then
+      begin
+        if S[I] = '''' then InStr := False;   // '' = two literals, same result
+        M[I] := ' ';
+        Inc(I);
+        Continue;
+      end;
+      case S[I] of
+        '{':
+          begin
+            Block := 1;
+            M[I] := ' ';
+            Inc(I);
+          end;
+        '(':
+          if (I < N) and (S[I + 1] = '*') then
+          begin
+            Block := 2;
+            M[I] := ' '; M[I + 1] := ' ';
+            Inc(I, 2);
+          end
+          else
+            Inc(I);
+        '/':
+          if (I < N) and (S[I + 1] = '/') then
+          begin
+            for var K := I to N do M[K] := ' ';
+            Break;
+          end
+          else
+            Inc(I);
+        '''':
+          begin
+            InStr := True;
+            M[I] := ' ';
+            Inc(I);
+          end;
+      else
+        Inc(I);
+      end;
+    end;
+    Result[L] := M;
   end;
 end;
 

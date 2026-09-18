@@ -261,6 +261,29 @@ type
     property OnLog: TLspLogEvent read FOnLog write FOnLog;
   end;
 
+type
+  /// <summary>The source positions (file + 0-based line) that ARE one symbol:
+  ///  its declaration and its implementation, for interface/virtual methods
+  ///  also those of the implementing classes. Candidates of a text scan are
+  ///  verified against this set instead of against the declaring FILE -
+  ///  with ten 'Init' methods in one unit the file check accepted all of
+  ///  them (forum report 2026-09: Find References 22 hits, and a rename
+  ///  would have renamed every Init of the unit).</summary>
+  TLspSymbolTargets = record
+  private
+    FKeys: TArray<string>;
+    class function Key(const AFile: string; ALine: Integer): string; static;
+  public
+    procedure Add(const AFile: string; ALine: Integer);
+    /// <summary>Adds the position AND where DelphiLSP's GotoDefinition takes
+    ///  it (declaration <-> implementation).</summary>
+    procedure AddWithPartner(AClient: TLspClient; const AFile: string;
+      ALine, ACol: Integer);
+    function Contains(const AFile: string; ALine: Integer): Boolean;
+    function Count: Integer;
+    function Text: string;
+  end;
+
 implementation
 
 { ELspError }
@@ -1599,6 +1622,58 @@ begin
   else
     Status('LSP: ' + FN + ' analysed but no diagnostics arrived '
       + '(inactive-region detection unavailable).');
+end;
+
+
+{ TLspSymbolTargets }
+
+class function TLspSymbolTargets.Key(const AFile: string; ALine: Integer): string;
+begin
+  Result := UpperCase(ExpandFileName(AFile)) + '|' + IntToStr(ALine);
+end;
+
+procedure TLspSymbolTargets.Add(const AFile: string; ALine: Integer);
+begin
+  if (AFile = '') or (ALine < 0) or Contains(AFile, ALine) then Exit;
+  FKeys := FKeys + [Key(AFile, ALine)];
+end;
+
+procedure TLspSymbolTargets.AddWithPartner(AClient: TLspClient;
+  const AFile: string; ALine, ACol: Integer);
+begin
+  Add(AFile, ALine);
+  if AClient = nil then Exit;
+  try
+    var D := AClient.GotoDefinition(AFile, ALine, ACol);
+    if Length(D) > 0 then
+      Add(TLspUri.FileUriToPath(D[0].Uri), D[0].Range.Start.Line);
+  except
+    // no partner - the position itself is still in the set
+  end;
+end;
+
+function TLspSymbolTargets.Contains(const AFile: string; ALine: Integer): Boolean;
+begin
+  var K := Key(AFile, ALine);
+  for var S in FKeys do
+    if S = K then Exit(True);
+  Result := False;
+end;
+
+function TLspSymbolTargets.Count: Integer;
+begin
+  Result := Length(FKeys);
+end;
+
+function TLspSymbolTargets.Text: string;
+begin
+  Result := '';
+  for var S in FKeys do
+  begin
+    var P := LastDelimiter('|', S);
+    Result := Result + '  ' + ExtractFileName(Copy(S, 1, P - 1)) + ':' +
+      IntToStr(StrToIntDef(Copy(S, P + 1, MaxInt), -1) + 1) + sLineBreak;
+  end;
 end;
 
 end.

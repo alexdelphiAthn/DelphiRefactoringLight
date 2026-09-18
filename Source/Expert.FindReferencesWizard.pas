@@ -12,7 +12,7 @@ interface
 uses
   System.SysUtils, System.Classes, System.IOUtils, System.Types, System.UITypes, System.Math, System.Generics.Collections,
   Vcl.Forms, Vcl.Dialogs, {$IFNDEF STANDALONE_BUILD}ToolsAPI,{$ENDIF}  Expert.EditorHelperIntf, Expert.FindReferencesDialog, Expert.LspManager, Lsp.Uri, Lsp.Protocol,
-  Lsp.Client, Delphi.FileEncoding, Expert.ScopeFiles;
+  Lsp.Client, Delphi.FileEncoding, Expert.ScopeFiles, Expert.UnitIndex;
 
 type
   TLspFindReferencesWizard = class{$IFNDEF STANDALONE_BUILD}(TNotifierObject, IOTAWizard, IOTAMenuWizard){$ENDIF}
@@ -25,10 +25,10 @@ type
     procedure DoGotoLocation(AItem: TFindReferenceItem);
 
     function FindCandidatesByText(const AOldName: string; const AFiles: TArray<string>): TFindReferenceItems;
-    function VerifyWithLsp(const ACandidates: TFindReferenceItems; const AOldName, ADefFilePath: string;
+    function VerifyWithLsp(const ACandidates: TFindReferenceItems; const AOldName: string;
+      const ATargets: TLspSymbolTargets;
       AClient: TLspClient): TFindReferenceItems;
     function ConvertLspLocations(const ALocations: TArray<TLspLocation>; const AOldName: string): TFindReferenceItems;
-    function IsInStringOrComment(const ALine: string; APos: Integer): Boolean;
 
     procedure SearchAndShow;
   public
@@ -238,14 +238,23 @@ begin
   // Resolve the declaration (for verification comparison)
   FDialog.SetStatus('Finding declaration...');
   var DefLocs := Client.GotoDefinition(FContext.FileName, LspLine, LspCol);
+  // The symbol = its declaration + implementation (see TLspSymbolTargets).
+  var Targets: TLspSymbolTargets;
   if Length(DefLocs) > 0 then
-    DefFilePath := TLspUri.FileUriToPath(DefLocs[0].Uri)
+  begin
+    DefFilePath := TLspUri.FileUriToPath(DefLocs[0].Uri);
+    Targets.AddWithPartner(Client, DefFilePath, DefLocs[0].Range.Start.Line,
+      DefLocs[0].Range.Start.Character);
+  end
   else
+  begin
+    // null AT a declaration: the caret is the symbol
     DefFilePath := FContext.FileName;
+    Targets.AddWithPartner(Client, FContext.FileName, LspLine, LspCol);
+  end;
 
   // Verify each candidate via GotoDefinition
-  Items := VerifyWithLsp(TextCandidates, FContext.WordAtCursor,
-    DefFilePath, Client);
+  Items := VerifyWithLsp(TextCandidates, FContext.WordAtCursor, Targets, Client);
 
   FDialog.SetItems(Items);
   FDialog.SetStatus(Format('Fallback: %d of %d candidate(s) verified.',
@@ -296,40 +305,11 @@ end;
 
 { Helper functions for text search (analogous to Rename wizard) }
 
-function TLspFindReferencesWizard.IsInStringOrComment(const ALine: string; APos: Integer): Boolean;
-var
-  I: Integer;
-  InString: Boolean;
-begin
-  Result := False;
-  for I := 1 to APos - 1 do
-    if (I < System.Length(ALine)) and (ALine[I] = '/') and (ALine[I + 1] = '/') then
-      Exit(True);
-  var BraceDepth := 0;
-  for I := 1 to APos - 1 do
-  begin
-    if ALine[I] = '{' then Inc(BraceDepth)
-    else if ALine[I] = '}' then Dec(BraceDepth);
-  end;
-  if BraceDepth > 0 then Exit(True);
-  var PSDepth := 0;
-  for I := 1 to APos - 2 do
-  begin
-    if (ALine[I] = '(') and (ALine[I+1] = '*') then Inc(PSDepth)
-    else if (ALine[I] = '*') and (ALine[I+1] = ')') then Dec(PSDepth);
-  end;
-  if PSDepth > 0 then Exit(True);
-  InString := False;
-  for I := 1 to APos - 1 do
-    if ALine[I] = '''' then InString := not InString;
-  if InString then Exit(True);
-end;
-
 function TLspFindReferencesWizard.FindCandidatesByText(const AOldName: string; const AFiles: TArray<string>): TFindReferenceItems;
 var
   CandidateList: TList<TFindReferenceItem>;
   F, Line, RawContent: string;
-  Lines: TArray<string>;
+  Lines, Masked: TArray<string>;
   UpperOldName: string;
   LineIdx, SearchPos, FoundPos, AfterPos: Integer;
   BeforeOk, AfterOk: Boolean;
@@ -352,6 +332,8 @@ begin
         RawContent := ReadDelphiFile(F);
         if Pos(UpperOldName, UpperCase(RawContent)) = 0 then Continue;
         Lines := ReadDelphiFileLines(F);
+        // comment/string state carried ACROSS lines (multi-line { })
+        Masked := MaskCommentsAndStrings(Lines);
       except
         Continue;
       end;
@@ -372,7 +354,7 @@ begin
           AfterOk := (AfterPos > System.Length(Line)) or
             not CharInSet(Line[AfterPos], ['A'..'Z','a'..'z','0'..'9','_']);
 
-          if BeforeOk and AfterOk and not IsInStringOrComment(Line, FoundPos) then
+          if BeforeOk and AfterOk and (Masked[LineIdx][FoundPos] = Line[FoundPos]) then
           begin
             Item.FilePath := F;
             Item.Line := LineIdx;
@@ -392,7 +374,8 @@ begin
   end;
 end;
 
-function TLspFindReferencesWizard.VerifyWithLsp(const ACandidates: TFindReferenceItems; const AOldName, ADefFilePath: string;
+function TLspFindReferencesWizard.VerifyWithLsp(const ACandidates: TFindReferenceItems; const AOldName: string;
+  const ATargets: TLspSymbolTargets;
   AClient: TLspClient): TFindReferenceItems;
 var
   Verified: TList<TFindReferenceItem>;
@@ -427,18 +410,15 @@ begin
       try
         var Defs := AClient.GotoDefinition(C.FilePath, C.Line, C.Col);
 
-        if System.Length(Defs) = 0 then
-        begin
-          // null = cursor is on the declaration itself
-          if SameText(ExpandFileName(C.FilePath), ExpandFileName(ADefFilePath)) then
-            Matches := True;
-        end
-        else
-        begin
-          var DefPath := TLspUri.FileUriToPath(Defs[0].Uri);
-          if SameText(ExpandFileName(DefPath), ExpandFileName(ADefFilePath)) then
-            Matches := True;
-        end;
+        // The candidate IS one of the symbol's positions (declaration /
+        // implementation - DelphiLSP answers those with null or with the
+        // counterpart), or DelphiLSP takes it to one of them. The FILE
+        // alone says nothing: several same-named methods in one unit.
+        if ATargets.Contains(C.FilePath, C.Line) then
+          Matches := True
+        else if System.Length(Defs) > 0 then
+          Matches := ATargets.Contains(TLspUri.FileUriToPath(Defs[0].Uri),
+            Defs[0].Range.Start.Line);
       except
         // Error -> location skipped
         Matches := False;

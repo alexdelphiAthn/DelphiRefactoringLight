@@ -2395,6 +2395,58 @@ end;
 
 // E2065 fix (methods/routines): appends an empty implementation block for
 // the declaration at ALine0 at the end of the implementation section.
+// AWord as a whole word in S (case-insensitive).
+function HasWholeWordCI(const S, AWord: string): Boolean;
+begin
+  var U := UpperCase(S);
+  var W := UpperCase(AWord);
+  var P := Pos(W, U);
+  while P > 0 do
+  begin
+    var BeforeOk := (P = 1) or not CharInSet(U[P - 1], ['A'..'Z', '0'..'9', '_']);
+    var AfterPos := P + Length(W);
+    var AfterOk := (AfterPos > Length(U)) or not CharInSet(U[AfterPos], ['A'..'Z', '0'..'9', '_']);
+    if BeforeOk and AfterOk then Exit(True);
+    P := Pos(W, U, P + 1);
+  end;
+  Result := False;
+end;
+
+// Parameter TYPES of a header's parameter list, normalised for comparing
+// overloads: 'const A, B: Integer; var S: string = ''x''' ->
+// 'const:integer;const:integer;var:string;'. Names and default values do
+// not distinguish overloads (and an implementation may omit the defaults).
+function OverloadParamSignature(const AParams: string): string;
+begin
+  Result := '';
+  for var G in AParams.Split([';']) do
+  begin
+    var S := Trim(G);
+    if S = '' then Continue;
+    var P := Pos('=', S);
+    if P > 0 then S := Trim(Copy(S, 1, P - 1));          // default value
+    var Modifier := '';
+    for var M in ['const', 'var', 'out', 'constref'] do
+      if StartsText(M + ' ', S) then
+      begin
+        Modifier := M;
+        S := Trim(Copy(S, Length(M) + 1, MaxInt));
+        Break;
+      end;
+    var TypeName := '';
+    P := Pos(':', S);
+    if P > 0 then
+    begin
+      TypeName := LowerCase(StringReplace(Trim(Copy(S, P + 1, MaxInt)), ' ', '', [rfReplaceAll]));
+      S := Copy(S, 1, P - 1);
+    end;
+    // one entry per NAME ('A, B: Integer' = two Integer parameters)
+    for var N in S.Split([',']) do
+      if Trim(N) <> '' then
+        Result := Result + Modifier + ':' + TypeName + ';';
+  end;
+end;
+
 function CreateImplStub(const AFile: string; ALine0: Integer): Boolean;
 var
   Content, Kind, Hdr, Qualified, BareName, Params, Ret, ContainerName, Text: string;
@@ -2413,6 +2465,12 @@ begin
   if not ParseHeader(Hdr, Kind, Qualified, Params, Ret) then Exit;
   if Pos('.', Qualified) > 0 then Exit;   // already an implementation header
   BareName := Qualified;
+  // 'overload' anywhere in the declaration's own lines (a wrapped header
+  // carries its directives on its last line)
+  var IsOverload := False;
+  for I := ALine0 to Min(HdrEnd, High(Lines)) do
+    if HasWholeWordCI(StripLineComment(Lines[I]), 'overload') then
+      IsOverload := True;
 
   ContainerName := EnclosingContainerName(Lines, ALine0);
   // An INDENTED declaration with no detected container means we failed to
@@ -2427,14 +2485,23 @@ begin
   if InsLine < 0 then Exit;   // also guards the loop below (impl exists)
 
   // Idempotence: refuse when a matching implementation header already
-  // exists (stale diagnostics / applying the same fix twice).
+  // exists (stale diagnostics / applying the same fix twice). For an
+  // OVERLOADED routine the name alone says nothing - forum report: the
+  // stub for 'class procedure Init(const xBoolean: Boolean); overload;'
+  // was refused because 'TMyClassStatic2.Init' (the parameterless
+  // overload) was already implemented. There the parameter types decide.
+  var WantSig := OverloadParamSignature(Params);
   for I := ImplementationLineOf(Lines) + 1 to High(Lines) do
     if IsHeaderLine(Lines[I], ChkKind, DummyCM) then
     begin
       Hdr := CollectHeader(Lines, I, HdrEnd);
       if (Hdr <> '') and ParseHeader(Hdr, ChkKind, ChkQual, ChkParams, ChkRet)
         and (SameText(ChkQual, Qualified)
-          or SameText(ChkQual, ContainerName + '.' + BareName)) then Exit;
+          or SameText(ChkQual, ContainerName + '.' + BareName)) then
+      begin
+        if not IsOverload then Exit;
+        if OverloadParamSignature(ChkParams) = WantSig then Exit;
+      end;
     end;
 
   Text := '';
