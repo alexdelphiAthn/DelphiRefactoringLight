@@ -90,6 +90,8 @@ type
       Size: Int64;
       Idents: TArray<string>;
       HasInit: Boolean;   // unit has an initialization/finalization section
+      Includes: TArray<string>;   // include files read while parsing
+      IncStamp: TDateTime;        // newest mtime among them at parse time
     end;
     TIndexWorker = class(TThread)
     private
@@ -216,7 +218,24 @@ function FindBdsRoot: string;
 ///  identifiers; AHasInit reports an initialization/finalization section
 ///  (load-time side effects). Exposed for the console test suite.</summary>
 function ParseUnit(const AFile: string; out AUnitName: string;
-  out AHasInit: Boolean): TArray<string>;
+  out AHasInit: Boolean): TArray<string>; overload;
+
+/// <summary>Same, and AIncludes receives the full paths of every include
+///  file that was read ({$I} / {$INCLUDE}, nested) - the cache must
+///  re-parse the unit when one of them changes.</summary>
+function ParseUnit(const AFile: string; out AUnitName: string;
+  out AHasInit: Boolean; out AIncludes: TArray<string>): TArray<string>; overload;
+
+/// <summary>AText with every {$I name} / {$INCLUDE name} (also the (*$...*)
+///  form) replaced by the content of that file, resolved against ABaseDir
+///  (name as written, then + '.inc' / '.pas' when it has no extension);
+///  nested includes resolve against their own directory, depth-limited.
+///  Directives inside comments and strings are left alone, {$I+}/{$I-}
+///  (I/O checking) is not an include, an unreadable file stays as the
+///  directive. AIncludes (may be nil) collects the files that were read.
+///  </summary>
+function ExpandIncludeDirectives(const AText, ABaseDir: string;
+  AIncludes: TStrings; ADepth: Integer = 0): string;
 
 /// <summary>0-based line of AIdent's DECLARATION inside AContent, or -1.
 ///  Prefers a real declaration form (type/const alias, routine header,
@@ -292,7 +311,7 @@ const
   // seeing "TcxButton / TStringGrid unknown" - which made uses-cleanup
   // offer units in use for REMOVAL, and left add-unit and "find original
   // symbol" blind for those types.
-  IndexParserVersion = '10';
+  IndexParserVersion = '11';
   //  10: enum members under {$SCOPEDENUMS ON} are not indexed - they are
   //      only reachable qualified ("TEnum.Test"); the tester got "add
   //      Winapi.Networking.NetworkOperators" for an undeclared Test
@@ -446,6 +465,135 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+//  Include files
+// ---------------------------------------------------------------------------
+
+const
+  MaxIncludeDepth = 8;
+
+function ResolveIncludeFile(const AName, ABaseDir: string): string;
+var
+  N: string;
+begin
+  Result := '';
+  N := Trim(AName);
+  if (Length(N) >= 2) and (N[1] = '''') and (N[Length(N)] = '''') then
+    N := Copy(N, 2, Length(N) - 2);
+  N := Trim(N).Replace('/', '\');
+  if N = '' then Exit;
+  try
+    if not TPath.IsPathRooted(N) then
+      N := TPath.Combine(ABaseDir, N);
+    if TFile.Exists(N) then Exit(TPath.GetFullPath(N));
+    if ExtractFileExt(N) = '' then
+      for var Ext in ['.inc', '.pas'] do
+        if TFile.Exists(N + Ext) then Exit(TPath.GetFullPath(N + Ext));
+  except
+    Result := '';   // invalid path characters in the directive
+  end;
+end;
+
+function ExpandIncludeDirectives(const AText, ABaseDir: string;
+  AIncludes: TStrings; ADepth: Integer): string;
+var
+  SB: TStringBuilder;
+  I, N, Start, Stop, CloseLen: Integer;
+  Body, U, Name, Path, Sub: string;
+begin
+  // cheap exit - almost no unit has an include
+  U := UpperCase(AText);
+  if (ADepth > MaxIncludeDepth) or
+     ((Pos('{$I', U) = 0) and (Pos('(*$I', U) = 0)) then
+    Exit(AText);
+  SB := TStringBuilder.Create(Length(AText) + 1024);
+  try
+    N := Length(AText);
+    I := 1;
+    while I <= N do
+    begin
+      var C := AText[I];
+      if C = '''' then
+      begin
+        // string literal ('' inside = two literals in a row, same result)
+        Start := I;
+        Inc(I);
+        while (I <= N) and (AText[I] <> '''') and (AText[I] <> #10) and
+              (AText[I] <> #13) do
+          Inc(I);
+        if (I <= N) and (AText[I] = '''') then Inc(I);
+        SB.Append(AText, Start - 1, I - Start);
+        Continue;
+      end;
+      if (C = '/') and (I < N) and (AText[I + 1] = '/') then
+      begin
+        Start := I;
+        while (I <= N) and (AText[I] <> #10) and (AText[I] <> #13) do Inc(I);
+        SB.Append(AText, Start - 1, I - Start);
+        Continue;
+      end;
+      if (C = '{') or ((C = '(') and (I < N) and (AText[I + 1] = '*')) then
+      begin
+        Start := I;
+        Body := '';
+        if C = '{' then
+        begin
+          Stop := PosEx('}', AText, I + 1);
+          CloseLen := 1;
+          if Stop = 0 then Stop := N + 1;
+          if (I < N) and (AText[I + 1] = '$') then
+            Body := Copy(AText, I + 2, Stop - I - 2);
+        end
+        else
+        begin
+          Stop := PosEx('*)', AText, I + 2);
+          CloseLen := 2;
+          if Stop = 0 then Stop := N + 1;
+          if (I + 2 <= N) and (AText[I + 2] = '$') then
+            Body := Copy(AText, I + 3, Stop - I - 3);
+        end;
+        I := Min(Stop + CloseLen, N + 1);
+        Name := '';
+        if Body <> '' then
+        begin
+          U := UpperCase(Body);
+          // "{$I+}" / "{$I-}" / "{$IFDEF" never match: a blank must follow
+          if StartsStr('INCLUDE', U) and (Length(U) > 7) and CharInSet(U[8], [' ', #9]) then
+            Name := Trim(Copy(Body, 9, MaxInt))
+          else if StartsStr('I', U) and (Length(U) > 1) and CharInSet(U[2], [' ', #9]) then
+            Name := Trim(Copy(Body, 3, MaxInt));
+        end;
+        if Name <> '' then
+        begin
+          Path := ResolveIncludeFile(Name, ABaseDir);
+          if Path <> '' then
+            try
+              Sub := TDelphiFileEncoding.ReadAll(Path);
+            except
+              Path := '';
+            end;
+          if Path <> '' then
+          begin
+            if AIncludes <> nil then AIncludes.Add(Path);
+            SB.Append(ExpandIncludeDirectives(Sub, ExtractFileDir(Path),
+              AIncludes, ADepth + 1));
+            // whatever follows the directive starts on a line of its own
+            SB.Append(#10);
+            Continue;
+          end;
+        end;
+        SB.Append(AText, Start - 1, I - Start);
+        Continue;
+      end;
+      SB.Append(C);
+      Inc(I);
+    end;
+    Result := SB.ToString;
+  finally
+    SB.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
 //  The interface-section parser
 // ---------------------------------------------------------------------------
 
@@ -454,6 +602,14 @@ end;
 // timestamp does not change (i.e. all of RTL/VCL and every library).
 function ParseUnit(const AFile: string; out AUnitName: string;
   out AHasInit: Boolean): TArray<string>;
+var
+  Dummy: TArray<string>;
+begin
+  Result := ParseUnit(AFile, AUnitName, AHasInit, Dummy);
+end;
+
+function ParseUnit(const AFile: string; out AUnitName: string;
+  out AHasInit: Boolean; out AIncludes: TArray<string>): TArray<string>;
 type
   TSect = (secNone, secType, secConst, secVar);
 var
@@ -544,11 +700,22 @@ var
 begin
   AUnitName := '';
   AHasInit := False;
+  AIncludes := nil;
   Result := nil;
   try
     Raw := TDelphiFileEncoding.ReadAll(AFile);
   except
     Exit;
+  end;
+  // Units that keep their code in an include file ('unit X; {$I X.inc}')
+  // would otherwise index as EMPTY - and uses cleanup then offers to
+  // remove them although they are in use.
+  var IncList := TStringList.Create;
+  try
+    Raw := ExpandIncludeDirectives(Raw, ExtractFileDir(AFile), IncList);
+    AIncludes := IncList.ToStringArray;
+  finally
+    IncList.Free;
   end;
   Lines := Raw.Replace(#13#10, #10).Replace(#13, #10).Split([#10]);
 
@@ -2555,6 +2722,10 @@ begin
         FS.WriteBuffer(U.MTime, SizeOf(U.MTime));
         FS.WriteBuffer(U.Size, SizeOf(U.Size));
         FS.WriteBuffer(U.HasInit, SizeOf(U.HasInit));
+        FS.WriteBuffer(U.IncStamp, SizeOf(U.IncStamp));
+        var NC := Length(U.Includes);
+        FS.WriteBuffer(NC, SizeOf(NC));
+        for var IncF in U.Includes do WStr(IncF);
         var IC := Length(U.Idents);
         FS.WriteBuffer(IC, SizeOf(IC));
         for var Id in U.Idents do WStr(Id);
@@ -2597,6 +2768,11 @@ begin
         FS.ReadBuffer(U.MTime, SizeOf(U.MTime));
         FS.ReadBuffer(U.Size, SizeOf(U.Size));
         FS.ReadBuffer(U.HasInit, SizeOf(U.HasInit));
+        FS.ReadBuffer(U.IncStamp, SizeOf(U.IncStamp));
+        var NC: Integer;
+        FS.ReadBuffer(NC, SizeOf(NC));
+        SetLength(U.Includes, NC);
+        for var J := 0 to NC - 1 do U.Includes[J] := RStr;
         var IC: Integer;
         FS.ReadBuffer(IC, SizeOf(IC));
         SetLength(U.Idents, IC);
@@ -2612,6 +2788,20 @@ begin
 end;
 
 // ---- the build / refresh pass (WORKER THREAD) -----------------------------
+
+// Newest mtime among a unit's include files; a vanished one counts as a
+// change (-1 never matches a stored stamp).
+function NewestIncludeTime(const AFiles: TArray<string>): TDateTime;
+begin
+  Result := 0;
+  for var F in AFiles do
+    try
+      if not TFile.Exists(F) then Exit(-1);
+      Result := Max(Result, TFile.GetLastWriteTime(F));
+    except
+      Exit(-1);
+    end;
+end;
 
 function TUnitIndex.RefreshScope(const ADirs, AFiles: TArray<string>;
   ADict: TObjectDictionary<string, TIndexedUnit>; const AScopeName: string): Boolean;
@@ -2660,16 +2850,20 @@ begin
         end;
         if Size > MaxFileBytes then Continue;
         if ADict.TryGetValue(Key, Info) and (Info.Size = Size) and
-           (Abs(Info.MTime - MT) < 1 / 86400) then
-          Continue;   // unchanged
+           (Abs(Info.MTime - MT) < 1 / 86400) and
+           (Abs(Info.IncStamp - NewestIncludeTime(Info.Includes)) < 1 / 86400) then
+          Continue;   // unchanged - the unit AND its include files
         var UName: string;
         var HasInit: Boolean;
-        var Idents := ParseUnit(F, UName, HasInit);
+        var Incs: TArray<string>;
+        var Idents := ParseUnit(F, UName, HasInit, Incs);
         if UName = '' then UName := ChangeFileExt(ExtractFileName(F), '');
         var NU := TIndexedUnit.Create;
         NU.Path := F; NU.UnitName := UName; NU.Size := Size; NU.MTime := MT;
         NU.Idents := Idents;
         NU.HasInit := HasInit;
+        NU.Includes := Incs;
+        NU.IncStamp := NewestIncludeTime(Incs);
         ADict.AddOrSetValue(Key, NU);
         Result := True;
       end;

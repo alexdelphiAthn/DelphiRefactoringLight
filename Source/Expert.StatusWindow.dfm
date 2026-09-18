@@ -1,4 +1,4 @@
-object StatusFrame: TStatusFrame
+object RlDockFrame: TRlDockFrame
   Left = 0
   Top = 0
   Width = 760

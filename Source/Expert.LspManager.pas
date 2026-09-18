@@ -288,6 +288,10 @@ begin
 
     // Neuen Client starten
     FClient := TLspClient.Create(FLspExePath);
+    // Diagnosis only: REFACTORINGLIGHT_LSP_ARGS=-LogModes 255 makes our
+    // session write %TEMP%\DelphiLSP\DelphiLSP.log (+ trace) - the only
+    // way to see WHY DelphiLSP answers nothing for a unit.
+    FClient.ExtraArgs := GetEnvironmentVariable('REFACTORINGLIGHT_LSP_ARGS');
     try
       FClient.Start;
       FClient.Initialize(ARootPath, AProjectFile);

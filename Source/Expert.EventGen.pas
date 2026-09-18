@@ -296,7 +296,30 @@ begin
             var J := I - 1;
             while (J >= 1) and CharInSet(S[J], [' ', #9]) do Dec(J);
             if J < 1 then Exit(False);
-            if S[J] = '>' then Exit(True);   // Foo<T>(
+            if S[J] = '>' then
+            begin
+              // Foo<T>( / Foo<A, TList<B>>( - skip the type arguments back
+              // to the NAME. Without its position there is no hover on the
+              // called routine, so its unit - where a nested parameter
+              // type like TAppCore.TCallback<T> lives - stays unknown
+              // (tester: "TAppCore.Register<IAppCoreLog>(" offered nothing).
+              var AD := 0;
+              while J >= 1 do
+              begin
+                if S[J] = '>' then
+                  Inc(AD)
+                else if S[J] = '<' then
+                begin
+                  Dec(AD);
+                  if AD = 0 then Break;
+                end;
+                Dec(J);
+              end;
+              if J < 1 then Exit(True);   // a call, but the name is not on this line
+              Dec(J);
+              while (J >= 1) and CharInSet(S[J], [' ', #9]) do Dec(J);
+              if (J < 1) or not IsIdentChar(S[J]) then Exit(True);
+            end;
             if not IsIdentChar(S[J]) then Exit(False);
             var K := J;
             while (K >= 1) and IsIdentChar(S[K]) do Dec(K);
@@ -724,8 +747,39 @@ end;
 function ResolveProcTypeDepth(const ATypeName, AContextFile: string;
   const ASource: TGenTypeSource; out AInfo: TProcTypeInfo; ADepth: Integer): Boolean;
 var
-  Base, Rhs, A: string;
+  Base, Rhs, A, Outer: string;
   Args, TypeParams: TArray<string>;
+  P: Integer;
+  Decided: Boolean;
+
+  function TryDecls(const ADecls: TArray<TGenDecl>): Boolean;
+  begin
+    Result := False;
+    for var Decl in ADecls do
+    begin
+      if not FindTypeDeclText(Decl.Content, Base, Length(Args), TypeParams, Rhs) then
+        Continue;
+      Decided := True;
+      Rhs := SubstituteTypeParams(Rhs, TypeParams, Args);
+      if ParseProcTypeText(Rhs, AInfo) then
+      begin
+        AInfo.TypeName := Trim(ATypeName);
+        Exit(True);
+      end;
+      // alias: TMyEvent = TNotifyEvent; / TMyEvent = type TNotifyEvent;
+      // resolved as seen from the unit that declares the alias
+      A := Trim(Rhs);
+      if StartsText('type ', A) then A := Trim(Copy(A, 6, MaxInt));
+      if IsTypeReference(A) and not SameText(A, Trim(ATypeName)) then
+        if ResolveProcTypeDepth(A, Decl.Path, ASource, AInfo, ADepth + 1) then
+        begin
+          AInfo.TypeName := Trim(ATypeName);
+          Exit(True);
+        end;
+      Exit(False);   // the visible declaration is not procedural
+    end;
+  end;
+
 begin
   Result := False;
   AInfo := Default(TProcTypeInfo);
@@ -745,28 +799,22 @@ begin
   // "TProc = procedure;" in its interface; taken as "the first TProc in
   // the index" it turned TThread.CreateAnonymousThread's "reference to
   // procedure" into a plain procedure, and nothing was offered.)
-  for var Decl in ASource(Base, AContextFile) do
-  begin
-    if not FindTypeDeclText(Decl.Content, Base, Length(Args), TypeParams, Rhs) then
-      Continue;
-    Rhs := SubstituteTypeParams(Rhs, TypeParams, Args);
-    if ParseProcTypeText(Rhs, AInfo) then
-    begin
-      AInfo.TypeName := Trim(ATypeName);
-      Exit(True);
-    end;
-    // alias: TMyEvent = TNotifyEvent; / TMyEvent = type TNotifyEvent;
-    // resolved as seen from the unit that declares the alias
-    A := Trim(Rhs);
-    if StartsText('type ', A) then A := Trim(Copy(A, 6, MaxInt));
-    if IsTypeReference(A) and not SameText(A, Trim(ATypeName)) then
-      if ResolveProcTypeDepth(A, Decl.Path, ASource, AInfo, ADepth + 1) then
-      begin
-        AInfo.TypeName := Trim(ATypeName);
-        Exit(True);
-      end;
-    Exit(False);   // the visible declaration is not procedural
-  end;
+  Decided := False;
+  if TryDecls(ASource(Base, AContextFile)) then Exit(True);
+  if Decided then Exit;
+  // A NESTED type ("TAppCore.TAppCoreProviderCallback<T>", declared in a
+  // class's own type section) is not in the index, which holds top-level
+  // declarations only - look for it in the units declaring the OUTER type.
+  Outer := Trim(ATypeName);
+  P := Pos('<', Outer);
+  if P > 0 then Outer := Copy(Outer, 1, P - 1);
+  P := LastDelimiter('.', Outer);
+  if P = 0 then Exit;
+  Outer := Copy(Outer, 1, P - 1);
+  P := LastDelimiter('.', Outer);     // Unit.TOuter -> TOuter
+  if P > 0 then Outer := Copy(Outer, P + 1, MaxInt);
+  if IsPascalIdentifier(Outer) then
+    Result := TryDecls(ASource(Outer, AContextFile));
 end;
 
 function ResolveProcType(const ATypeName, AContextFile: string;

@@ -35,9 +35,53 @@ type
     Hits: TArray<TDfmHit>;
   end;
 
+  /// <summary>What the rename pipeline needs from its front end. The
+  ///  dialog is one (TDialogRenameHost); the MCP bridge runs the SAME
+  ///  pipeline without a window through its own host - so preview, LSP
+  ///  verification, implementations and form files stay identical.</summary>
+  IRenameHost = interface
+    ['{3C1F7B2A-94D6-4E0B-A8C5-6E2D19F07B41}']
+    function GetNewName: string;
+    function Scope: TRenameScope;
+    function SelectedUnits: TArray<string>;
+    function IncludeOpenUnits: Boolean;
+    function IncludeUsedUnits: Boolean;
+    function ScanCancelled: Boolean;
+    procedure SetBusy(ABusy: Boolean);
+    procedure SetStatus(const AText: string);
+    procedure SetProgress(AValue, AMax: Integer);
+    procedure SetPreviewItems(const AItems: TRenamePreviewItems);
+    procedure SetDetailsText(const AText: string);
+    procedure EnableRename(AEnabled: Boolean);
+    /// <summary>A message the dialog shows in a box (validation, outcome).
+    ///  </summary>
+    procedure Notify(const AText: string; AWarning: Boolean);
+  end;
+
+  TDialogRenameHost = class(TInterfacedObject, IRenameHost)
+  private
+    FDialog: TRenameDialog;
+  public
+    constructor Create(ADialog: TRenameDialog);
+    function GetNewName: string;
+    function Scope: TRenameScope;
+    function SelectedUnits: TArray<string>;
+    function IncludeOpenUnits: Boolean;
+    function IncludeUsedUnits: Boolean;
+    function ScanCancelled: Boolean;
+    procedure SetBusy(ABusy: Boolean);
+    procedure SetStatus(const AText: string);
+    procedure SetProgress(AValue, AMax: Integer);
+    procedure SetPreviewItems(const AItems: TRenamePreviewItems);
+    procedure SetDetailsText(const AText: string);
+    procedure EnableRename(AEnabled: Boolean);
+    procedure Notify(const AText: string; AWarning: Boolean);
+  end;
+
   TLspRenameWizard = class{$IFNDEF STANDALONE_BUILD}(TNotifierObject, IOTAWizard, IOTAMenuWizard){$ENDIF}
   private
     FDialog: TRenameDialog;
+    FHost: IRenameHost;
     // Form files (see CollectFormEdits). The LSP knows nothing about them,
     // so they are planned separately and applied BEFORE the source edits:
     // an open form is renamed through its designer, which also renames the
@@ -105,6 +149,16 @@ type
     ///  preview list and confirms just like with a normal identifier
     ///  rename.</summary>
     procedure ExecuteForUnit(const AOldUnitName, ANewUnitName: string);
+
+    /// <summary>Identifier rename WITHOUT the dialog (MCP bridge): runs the
+    ///  normal preview for AContext (file, 1-based line/column, the
+    ///  identifier) against AHost. True when there is something to apply.
+    ///  Main thread; saves all files first, like the dialog.</summary>
+    function PreviewHeadless(const AContext: TEditorContext;
+      const AHost: IRenameHost): Boolean;
+    /// <summary>Applies the edits of the last PreviewHeadless; the outcome
+    ///  arrives through AHost.Notify.</summary>
+    procedure ApplyHeadless(const AHost: IRenameHost);
   end;
 
 var
@@ -113,6 +167,34 @@ var
 implementation
 
 {$IFNDEF STANDALONE_BUILD}
+// True when the identifier at (ALine0, ACol0) directly follows a declaring
+// keyword - 'procedure X', 'class function X', 'constructor X',
+// 'destructor X', 'property X' - i.e. the caret is ON a declaration.
+function CaretOnDeclaration(const AFile: string; ALine0, ACol0: Integer): Boolean;
+var
+  Lines: TArray<string>;
+  S, Before: string;
+  P: Integer;
+begin
+  Result := False;
+  try
+    Lines := ReadDelphiFileLines(AFile);
+  except
+    Exit;
+  end;
+  if (ALine0 < 0) or (ALine0 > High(Lines)) then Exit;
+  S := Lines[ALine0];
+  // start of the identifier under the caret (1-based)
+  P := ACol0 + 1;
+  if (P < 1) or (P > Length(S) + 1) then Exit;
+  while (P > 1) and (CharInSet(S[P - 1], ['A'..'Z', 'a'..'z', '0'..'9', '_'])) do
+    Dec(P);
+  Before := LowerCase(Trim(Copy(S, 1, P - 1)));
+  for var K in ['procedure', 'function', 'constructor', 'destructor', 'property'] do
+    if (Before = K) or EndsStr(' ' + K, Before) then
+      Exit(True);
+end;
+
 { TLspRenameWizard - IOTANotifier / IOTAWizard / IOTAMenuWizard stubs.
   Only compiled into the IDE plugin; the standalone build does not
   inherit from TNotifierObject and never needs these. }
@@ -156,6 +238,7 @@ begin
   end;
 
   FDialog := TRenameDialog.CreateDialog(Application.MainForm, FContext.WordAtCursor);
+  FHost := TDialogRenameHost.Create(FDialog);
   try
     FDialog.OnPreviewRequested := DoPreview;
     FDialog.SetCheckContext(FContext.FileName, Editor.GetProjectSourceFiles);
@@ -163,6 +246,7 @@ begin
     if FDialog.ShowModal = mrOk then
       ApplyFEdit;
   finally
+    FHost := nil;
     FDialog.Free;
     FDialog := nil;
   end;
@@ -192,6 +276,7 @@ begin
     FContext.IsValid := True;
 
     FDialog := TRenameDialog.CreateDialog(Application.MainForm, AOldUnitName);
+    FHost := TDialogRenameHost.Create(FDialog);
     try
       FDialog.OnPreviewRequested := DoPreview;
       FDialog.SetNewName(ANewUnitName);
@@ -199,6 +284,7 @@ begin
       if FDialog.ShowModal = mrOk then
         ApplyFEdit;
     finally
+      FHost := nil;
       FDialog.Free;
       FDialog := nil;
     end;
@@ -325,11 +411,11 @@ begin
     end;
 
     if (FailedCount = 0) and (FormNotes = '') then
-      MessageDlg(Format('%d change(s) applied successfully (Ctrl+Z to undo).',
-        [AppliedCount]), mtInformation, [mbOK], 0)
+      FHost.Notify(Format('%d change(s) applied successfully (Ctrl+Z to undo).',
+        [AppliedCount]), False)
     else
-      MessageDlg(Format('%d applied, %d failed.%s',
-        [AppliedCount, FailedCount, FormNotes]), mtWarning, [mbOK], 0);
+      FHost.Notify(Format('%d applied, %d failed.%s',
+        [AppliedCount, FailedCount, FormNotes]), True);
   finally
     FormFilesHandled.Free;
     AffectedFiles.Free;
@@ -527,6 +613,99 @@ begin
         end;
 end;
 
+function TLspRenameWizard.PreviewHeadless(const AContext: TEditorContext;
+  const AHost: IRenameHost): Boolean;
+begin
+  FUnitRenameMode := False;
+  FContext := AContext;
+  FEdit := Default(TLspWorkspaceEdit);
+  FHost := AHost;
+  DoPreview(nil);
+  Result := Length(FEdit.FileEdits) > 0;
+end;
+
+procedure TLspRenameWizard.ApplyHeadless(const AHost: IRenameHost);
+begin
+  FHost := AHost;
+  ApplyFEdit;
+end;
+
+{ TDialogRenameHost }
+
+constructor TDialogRenameHost.Create(ADialog: TRenameDialog);
+begin
+  inherited Create;
+  FDialog := ADialog;
+end;
+
+function TDialogRenameHost.GetNewName: string;
+begin
+  Result := FDialog.GetNewName;
+end;
+
+function TDialogRenameHost.Scope: TRenameScope;
+begin
+  Result := FDialog.Scope;
+end;
+
+function TDialogRenameHost.SelectedUnits: TArray<string>;
+begin
+  Result := FDialog.SelectedUnits;
+end;
+
+function TDialogRenameHost.IncludeOpenUnits: Boolean;
+begin
+  Result := FDialog.IncludeOpenUnits;
+end;
+
+function TDialogRenameHost.IncludeUsedUnits: Boolean;
+begin
+  Result := FDialog.IncludeUsedUnits;
+end;
+
+function TDialogRenameHost.ScanCancelled: Boolean;
+begin
+  Result := FDialog.ScanCancelled;
+end;
+
+procedure TDialogRenameHost.SetBusy(ABusy: Boolean);
+begin
+  FDialog.SetBusy(ABusy);
+end;
+
+procedure TDialogRenameHost.SetStatus(const AText: string);
+begin
+  FDialog.SetStatus(AText);
+end;
+
+procedure TDialogRenameHost.SetProgress(AValue, AMax: Integer);
+begin
+  FDialog.SetProgress(AValue, AMax);
+end;
+
+procedure TDialogRenameHost.SetPreviewItems(const AItems: TRenamePreviewItems);
+begin
+  FDialog.SetPreviewItems(AItems);
+end;
+
+procedure TDialogRenameHost.SetDetailsText(const AText: string);
+begin
+  FDialog.SetDetailsText(AText);
+end;
+
+procedure TDialogRenameHost.EnableRename(AEnabled: Boolean);
+begin
+  FDialog.EnableRename(AEnabled);
+end;
+
+procedure TDialogRenameHost.Notify(const AText: string; AWarning: Boolean);
+begin
+  if AWarning then
+    MessageDlg(AText, mtWarning, [mbOK], 0)
+  else
+    MessageDlg(AText, mtInformation, [mbOK], 0);
+end;
+
 procedure TLspRenameWizard.DoPreview(Sender: TObject);
 begin
   // a previous preview's form plans must never be applied to this one
@@ -545,24 +724,24 @@ var
   PreviewItems: TRenamePreviewItems;
   TotalEdits: Integer;
 begin
-  NewName := FDialog.GetNewName;
+  NewName := FHost.GetNewName;
   if NewName = '' then
   begin
-    MessageDlg('Please enter a new name.', mtWarning, [mbOK], 0);
+    FHost.Notify('Please enter a new name.', True);
     Exit;
   end;
   // Case-sensitive compare: a case-only change (foo -> Foo) is a
   // legitimate rename in Pascal and must go through the full pipeline.
   if NewName = FContext.WordAtCursor then
   begin
-    MessageDlg('The new name is identical to the old one.', mtWarning, [mbOK], 0);
+    FHost.Notify('The new name is identical to the old one.', True);
     Exit;
   end;
 
   // Save all dirty files so the text scan sees their current state
   Editor.SaveAllFiles;
 
-  FDialog.SetBusy(True);
+  FHost.SetBusy(True);
   FDiagLog := '';
   try
     // Units outside the project that use the renamed unit need the new
@@ -576,17 +755,17 @@ begin
       sLineBreak +
       'Text search (whole-word, skipping strings and comments)...' + sLineBreak;
 
-    FDialog.SetStatus(Format('Scanning %d project file(s)...', [Length(ProjFiles)]));
+    FHost.SetStatus(Format('Scanning %d project file(s)...', [Length(ProjFiles)]));
     Candidates := FindCandidates(FContext.WordAtCursor, ProjFiles);
     FDiagLog := FDiagLog + 'Text candidates: ' + IntToStr(Length(Candidates)) + sLineBreak;
 
     if Length(Candidates) = 0 then
     begin
-      FDialog.SetPreviewItems(nil);
-      FDialog.SetDetailsText(Format('No references to unit "%s" found in the project.',
+      FHost.SetPreviewItems(nil);
+      FHost.SetDetailsText(Format('No references to unit "%s" found in the project.',
         [FContext.WordAtCursor]) + sLineBreak + sLineBreak + FDiagLog);
-      FDialog.SetStatus('Done - no matches.');
-      FDialog.SetBusy(False);
+      FHost.SetStatus('Done - no matches.');
+      FHost.SetBusy(False);
       Exit;
     end;
 
@@ -603,14 +782,14 @@ begin
     // A CANCELLED scan has only partial candidates - never present that
     // as a finished preview (applying it would rename some occurrences
     // and silently leave the rest behind).
-    if FDialog.ScanCancelled then
+    if FHost.ScanCancelled then
     begin
-      FDialog.SetPreviewItems(nil);
-      FDialog.SetDetailsText('Preview cancelled by the user.' + sLineBreak +
+      FHost.SetPreviewItems(nil);
+      FHost.SetDetailsText('Preview cancelled by the user.' + sLineBreak +
         sLineBreak + FDiagLog);
-      FDialog.SetStatus('Preview cancelled - nothing was changed.');
-      FDialog.EnableRename(False);
-      FDialog.SetBusy(False);
+      FHost.SetStatus('Preview cancelled - nothing was changed.');
+      FHost.EnableRename(False);
+      FHost.SetBusy(False);
       Exit;
     end;
 
@@ -618,22 +797,22 @@ begin
     for var FE in FEdit.FileEdits do
       Inc(TotalEdits, Length(FE.Edits));
 
-    FDialog.SetPreviewItems(PreviewItems);
+    FHost.SetPreviewItems(PreviewItems);
 
-    FDialog.SetDetailsText(FDiagLog);
-    FDialog.EnableRename(True);
-    FDialog.SetStatus(Format('Done: %d change(s) in %d file(s).',
+    FHost.SetDetailsText(FDiagLog);
+    FHost.EnableRename(True);
+    FHost.SetStatus(Format('Done: %d change(s) in %d file(s).',
       [TotalEdits, Length(FEdit.FileEdits)]));
   except
     on E: Exception do
     begin
       FDiagLog := FDiagLog + sLineBreak + 'EXCEPTION: ' + E.ClassName + ': ' + E.Message;
-      FDialog.SetPreviewItems(nil);
-      FDialog.SetDetailsText(FDiagLog);
-      FDialog.SetStatus('An error occurred.');
+      FHost.SetPreviewItems(nil);
+      FHost.SetDetailsText(FDiagLog);
+      FHost.SetStatus('An error occurred.');
     end;
   end;
-  FDialog.SetBusy(False);
+  FHost.SetBusy(False);
 end;
 
 function TLspRenameWizard.BuildEditFromCandidates(const ACandidates: TArray<TRenameCandidate>;
@@ -682,27 +861,26 @@ var
   Client: TLspClient;
   ScopeFirst, ScopeLast: Integer;   // "current method" line window (0-based)
 begin
-  NewName := FDialog.GetNewName;
+  NewName := FHost.GetNewName;
   if NewName = '' then
   begin
-    MessageDlg('Please enter a new name.', mtWarning, [mbOK], 0);
+    FHost.Notify('Please enter a new name.', True);
     Exit;
   end;
   // Case-sensitive compare: a case-only change (foo -> Foo) is a
   // legitimate rename in Pascal and must go through the full pipeline.
   if NewName = FContext.WordAtCursor then
   begin
-    MessageDlg('The new name is identical to the old one.', mtWarning, [mbOK], 0);
+    FHost.Notify('The new name is identical to the old one.', True);
     Exit;
   end;
 
   DelphiLspJson := Editor.FindDelphiLspJson;
   if DelphiLspJson = '' then
   begin
-    MessageDlg('No .delphilsp.json found.' + sLineBreak +
+    FHost.Notify('No .delphilsp.json found.' + sLineBreak +
       'Please enable: Tools > Options > Editor > Language > ' +
-      'Code Insight > "Generate LSP Config".',
-      mtWarning, [mbOK], 0);
+      'Code Insight > "Generate LSP Config".', True);
     Exit;
   end;
 
@@ -710,11 +888,11 @@ begin
   if RootPath = '' then
     RootPath := ExtractFilePath(FContext.FileName);
 
-  FDialog.SetBusy(True);
+  FHost.SetBusy(True);
   FDiagLog := '';
   try
     // Save all unsaved files (so LSP sees the current state).
-    FDialog.SetStatus('Saving all files...');
+    FHost.SetStatus('Saving all files...');
     Editor.SaveAllFiles;
 
     FDiagLog := '=== Diagnostics ===' + sLineBreak +
@@ -730,11 +908,11 @@ begin
     // works on it.
     ScopeFirst := -1;
     ScopeLast := -1;
-    case FDialog.Scope of
+    case FHost.Scope of
       rscCurrentUnit:
         begin
           ProjFiles := [FContext.FileName];
-          FDialog.SetStatus('Scope: current unit.');
+          FHost.SetStatus('Scope: current unit.');
         end;
       rscCurrentMethod:
         begin
@@ -745,22 +923,21 @@ begin
           if not FindEnclosingRoutineRange(MethContent, FContext.Line - 1,
             ScopeFirst, ScopeLast) then
           begin
-            MessageDlg('The caret is not inside a method body - ' +
-              'choose another scope.', mtWarning, [mbOK], 0);
-            FDialog.SetBusy(False);
+            FHost.Notify('The caret is not inside a method body - ' +
+              'choose another scope.', True);
+            FHost.SetBusy(False);
             Exit;
           end;
-          FDialog.SetStatus(Format('Scope: current method (lines %d-%d).',
+          FHost.SetStatus(Format('Scope: current method (lines %d-%d).',
             [ScopeFirst + 1, ScopeLast + 1]));
         end;
       rscSelectedUnits:
         begin
-          ProjFiles := FDialog.SelectedUnits;
+          ProjFiles := FHost.SelectedUnits;
           if Length(ProjFiles) = 0 then
           begin
-            MessageDlg('No units selected - press "Select..." first.',
-              mtWarning, [mbOK], 0);
-            FDialog.SetBusy(False);
+            FHost.Notify('No units selected - press "Select..." first.', True);
+            FHost.SetBusy(False);
             Exit;
           end;
           // The declaration lives where the caret is - keep that file in
@@ -769,7 +946,7 @@ begin
           for var PF in ProjFiles do
             if SameText(PF, FContext.FileName) then HaveCur := True;
           if not HaveCur then ProjFiles := ProjFiles + [FContext.FileName];
-          FDialog.SetStatus(Format('Scope: %d selected unit(s).',
+          FHost.SetStatus(Format('Scope: %d selected unit(s).',
             [Length(ProjFiles)]));
         end;
     else
@@ -780,8 +957,8 @@ begin
       begin
         var Extra: TScopeExtra;
         ProjFiles := ProjectScopeFiles(FContext.FileName,
-          FDialog.IncludeOpenUnits, FDialog.IncludeUsedUnits, Extra);
-        FDialog.SetStatus('Scope: ' + ScopeExtraText(Length(ProjFiles), Extra) + '.');
+          FHost.IncludeOpenUnits, FHost.IncludeUsedUnits, Extra);
+        FHost.SetStatus('Scope: ' + ScopeExtraText(Length(ProjFiles), Extra) + '.');
         FDiagLog := FDiagLog + 'Scope: ' +
           ScopeExtraText(Length(ProjFiles), Extra) + sLineBreak;
       end;
@@ -789,7 +966,7 @@ begin
     FDiagLog := FDiagLog + 'Project files: ' + IntToStr(Length(ProjFiles)) + sLineBreak + sLineBreak;
 
     // Phase 1: text search over project files
-    FDialog.SetStatus('Phase 1: text search...');
+    FHost.SetStatus('Phase 1: text search...');
     Candidates := FindCandidates(FContext.WordAtCursor, ProjFiles);
     // "In current method": drop everything outside the routine's lines.
     if ScopeFirst >= 0 then
@@ -808,19 +985,19 @@ begin
 
     if Length(Candidates) = 0 then
     begin
-      FDialog.SetPreviewItems(nil);
-      FDialog.SetDetailsText('No occurrences found.' + sLineBreak + sLineBreak + FDiagLog);
-      FDialog.SetStatus('Done - no matches.');
-      FDialog.SetBusy(False);
+      FHost.SetPreviewItems(nil);
+      FHost.SetDetailsText('No occurrences found.' + sLineBreak + sLineBreak + FDiagLog);
+      FHost.SetStatus('Done - no matches.');
+      FHost.SetBusy(False);
       Exit;
     end;
 
     // Phase 2: start LSP (singleton - first call slow, later calls instant)
     var WasRunning := TLspManager.Instance.IsAlive;
     if WasRunning then
-      FDialog.SetStatus('LSP already running. Opening file...')
+      FHost.SetStatus('LSP already running. Opening file...')
     else
-      FDialog.SetStatus('Starting LSP server (one-time)...');
+      FHost.SetStatus('Starting LSP server (one-time)...');
 
     Client := TLspManager.Instance.GetClient(
       RootPath, FContext.ProjectFile, DelphiLspJson);
@@ -838,7 +1015,7 @@ begin
       var LspLine := FContext.Line - 1;
       var LspCol := FContext.Column - 1;      for var Retry := 1 to 30 do
       begin
-        FDialog.SetStatus(Format('Waiting for LSP indexing... (%d/30)', [Retry]));
+        FHost.SetStatus(Format('Waiting for LSP indexing... (%d/30)', [Retry]));
         Application.ProcessMessages;
         try
           var H := Client.GetHover(FContext.FileName, LspLine, LspCol);
@@ -853,7 +1030,7 @@ begin
       Sleep(500);
 
     // Phase 2b: find declaration
-    FDialog.SetStatus('Finding declaration...');
+    FHost.SetStatus('Finding declaration...');
 
     var LspLine := FContext.Line - 1;
     var LspCol := FContext.Column - 1;
@@ -868,7 +1045,22 @@ begin
       DefCol := DefLocs[0].Range.Start.Character;
     end
     else
+    begin
       DefFilePath := FContext.FileName;
+      // DelphiLSP answers GotoDefinition AT a declaration with null. When
+      // the caret sits on one ('procedure X', 'function X', 'property X'
+      // ...), the caret IS the declaration - without this the wizard took
+      // "<file>:1:1", found no owner type and skipped the implementing
+      // classes in other units (renaming IRenameHost.SetStatus left
+      // THeadlessRenameHost.SetStatus behind - did not compile).
+      if CaretOnDeclaration(FContext.FileName, LspLine, LspCol) then
+      begin
+        DefLine := LspLine;
+        DefCol := LspCol;
+        FDiagLog := FDiagLog + 'LSP gave no definition - the caret is on a ' +
+          'declaration, using it.' + sLineBreak;
+      end;
+    end;
 
     FDiagLog := FDiagLog + 'Declaration: ' + DefFilePath + ':' + IntToStr(DefLine + 1) + ':' + IntToStr(DefCol + 1) + sLineBreak;
 
@@ -876,7 +1068,7 @@ begin
     // renaming every use but not the declaration does not compile. For
     // the whole-project scope, scan that file too (never inside the
     // RAD Studio installation: the RTL/VCL is not ours to rename).
-    if (FDialog.Scope = rscProject) and (DefFilePath <> '')
+    if (FHost.Scope = rscProject) and (DefFilePath <> '')
       and TFile.Exists(DefFilePath) then
     begin
       var HaveDecl := False;
@@ -900,7 +1092,7 @@ begin
     // Text-based scan over all project files with syntax filter on lines
     // like 'procedure TClass.Method'. Only classes that implement the
     // container (owner) type of the method are kept.
-    FDialog.SetStatus('Searching for interface implementations...');
+    FHost.SetStatus('Searching for interface implementations...');
 
     var OwnerType := TImplementationFinder.FindContainingType(DefFilePath, DefLine);
     FDiagLog := FDiagLog + 'Owner type for impl verification: ' +
@@ -946,7 +1138,7 @@ begin
       end;
 
       // Phase 3: LSP verification
-      FDialog.SetStatus(Format('%d candidate(s). Verifying...', [Length(Candidates)]));
+      FHost.SetStatus(Format('%d candidate(s). Verifying...', [Length(Candidates)]));
 
       ImplFilesArray := ImplFilesList.ToArray;
       FEdit := VerifyWithLsp(Candidates, FContext.WordAtCursor, NewName, DefFilePath, ImplFilesArray, Client);
@@ -958,20 +1150,20 @@ begin
     // Only when the LSP actually told us where the declaration is, and not
     // for the "current method" scope (locals never appear in a form).
     FFormPlans := nil;
-    if (Length(DefLocs) > 0) and (FDialog.Scope <> rscCurrentMethod)
-      and not FDialog.ScanCancelled then
+    if (Length(DefLocs) > 0) and (FHost.Scope <> rscCurrentMethod)
+      and not FHost.ScanCancelled then
     begin
-      FDialog.SetStatus('Checking form files...');
+      FHost.SetStatus('Checking form files...');
       CollectFormEdits(ProjFiles, DefFilePath, DefLine, OwnerType,
         FContext.WordAtCursor, NewName);
     end;
 
     if Length(FEdit.FileEdits) = 0 then
     begin
-      FDialog.SetPreviewItems(nil);
-      FDialog.SetDetailsText(FDiagLog);
-      FDialog.SetStatus('Done - no verified matches.');
-      FDialog.SetBusy(False);
+      FHost.SetPreviewItems(nil);
+      FHost.SetDetailsText(FDiagLog);
+      FHost.SetStatus('Done - no verified matches.');
+      FHost.SetBusy(False);
       Exit;
     end;
 
@@ -982,14 +1174,14 @@ begin
     // A CANCELLED scan has only partial candidates - never present that
     // as a finished preview (applying it would rename some occurrences
     // and silently leave the rest behind).
-    if FDialog.ScanCancelled then
+    if FHost.ScanCancelled then
     begin
-      FDialog.SetPreviewItems(nil);
-      FDialog.SetDetailsText('Preview cancelled by the user.' + sLineBreak +
+      FHost.SetPreviewItems(nil);
+      FHost.SetDetailsText('Preview cancelled by the user.' + sLineBreak +
         sLineBreak + FDiagLog);
-      FDialog.SetStatus('Preview cancelled - nothing was changed.');
-      FDialog.EnableRename(False);
-      FDialog.SetBusy(False);
+      FHost.SetStatus('Preview cancelled - nothing was changed.');
+      FHost.EnableRename(False);
+      FHost.SetBusy(False);
       Exit;
     end;
 
@@ -997,12 +1189,12 @@ begin
     for var FE in FEdit.FileEdits do
       Inc(TotalEdits, Length(FE.Edits));
 
-    FDialog.SetPreviewItems(PreviewItems);
+    FHost.SetPreviewItems(PreviewItems);
     // A LIMITED scope can leave the declaration out - the result would
     // not compile. The preview must say that plainly; it is still a
     // legitimate choice (renaming a local variable, or a staged rename).
     var ScopeWarn := '';
-    if (FDialog.Scope <> rscProject) and (DefFilePath <> '') then
+    if (FHost.Scope <> rscProject) and (DefFilePath <> '') then
     begin
       var DeclCovered := False;
       for var FE in FEdit.FileEdits do
@@ -1016,20 +1208,20 @@ begin
         ScopeWarn := '  WARNING: the declaration is OUTSIDE the selected ' +
           'scope and stays unchanged.';
     end;
-    FDialog.SetDetailsText(TrimLeft(ScopeWarn) + sLineBreak + sLineBreak + FDiagLog);
-    FDialog.EnableRename(True);
-    FDialog.SetStatus(Format('Done: %d change(s) in %d file(s).%s',
+    FHost.SetDetailsText(TrimLeft(ScopeWarn) + sLineBreak + sLineBreak + FDiagLog);
+    FHost.EnableRename(True);
+    FHost.SetStatus(Format('Done: %d change(s) in %d file(s).%s',
       [TotalEdits, Length(FEdit.FileEdits), ScopeWarn]));
   except
     on E: Exception do
     begin
       FDiagLog := FDiagLog + sLineBreak + 'EXCEPTION: ' + E.ClassName + ': ' + E.Message;
-      FDialog.SetPreviewItems(nil);
-      FDialog.SetDetailsText(FDiagLog);
-      FDialog.SetStatus('An error occurred.');
+      FHost.SetPreviewItems(nil);
+      FHost.SetDetailsText(FDiagLog);
+      FHost.SetStatus('An error occurred.');
     end;
   end;
-  FDialog.SetBusy(False);
+  FHost.SetBusy(False);
 end;
 
 { Helper functions }
@@ -1078,14 +1270,14 @@ begin
   UpperOldName := UpperCase(AOldName);
   CandidateList := TList<TRenameCandidate>.Create;
   try
-    FDialog.SetProgress(0, Length(AFiles));
+    FHost.SetProgress(0, Length(AFiles));
 
     for var FileIdx := 0 to High(AFiles) do
     begin
       F := AFiles[FileIdx];
       if (FileIdx mod 10 = 0) then
-        FDialog.SetProgress(FileIdx + 1, Length(AFiles));
-      if FDialog.ScanCancelled then Break;
+        FHost.SetProgress(FileIdx + 1, Length(AFiles));
+      if FHost.ScanCancelled then Break;
 
       try
         RawContent := ReadDelphiFile(F);
@@ -1124,7 +1316,7 @@ begin
       end;
     end;
 
-    FDialog.SetProgress(Length(AFiles), Length(AFiles));
+    FHost.SetProgress(Length(AFiles), Length(AFiles));
     Result := CandidateList.ToArray;
   finally
     CandidateList.Free;
@@ -1151,9 +1343,9 @@ begin
   Items := TImplementationFinder.FindByProjectScan(AProjectFiles, AOldName, AOwnerType,
     procedure(ACurrent, ATotal: Integer)
     begin
-      FDialog.SetProgress(ACurrent, ATotal);
+      FHost.SetProgress(ACurrent, ATotal);
       if (ACurrent mod 10 = 0) or (ACurrent = ATotal) then
-        FDialog.SetStatus(Format('Phase 2c: scanning implementations (%d/%d)...',
+        FHost.SetStatus(Format('Phase 2c: scanning implementations (%d/%d)...',
           [ACurrent, ATotal]));
     end);
 
@@ -1208,29 +1400,80 @@ function TLspRenameWizard.BuildPreviewItems(const AEdit: TLspWorkspaceEdit; cons
       StartsStr('class operator ', Trimmed);
   end;
 
+  // 0-based line of the 'implementation' keyword, -1 when there is none
+  // (program files, include files).
+  function ImplementationLineOf(const ALines: TArray<string>): Integer;
+  begin
+    for var I := 0 to High(ALines) do
+      if SameText(Trim(ALines[I]), 'implementation') then
+        Exit(I);
+    Result := -1;
+  end;
+
+  // Kind of the type whose body contains ALine: 'interface', 'class'
+  // (also record / object) or '' for a free routine. Walks up to the
+  // nearest type opener; a bare 'end;' or a section keyword on the way
+  // means the line is outside any type body.
+  function EnclosingTypeKind(const ALines: TArray<string>; ALine: Integer): string;
+  begin
+    Result := '';
+    for var I := ALine - 1 downto 0 do
+    begin
+      var S := LowerCase(Trim(ALines[I]));
+      if (S = 'end;') or (S = 'interface') or (S = 'implementation') or
+         (S = 'type') then
+        Exit;
+      var P := Pos('=', S);
+      if P < 2 then Continue;
+      var Rhs := Trim(Copy(S, P + 1, MaxInt));
+      if StartsStr('packed ', Rhs) then Rhs := Trim(Copy(Rhs, 8, MaxInt));
+      // 'TFoo = class;' is a forward declaration, 'class of' a metaclass
+      if EndsStr(';', Rhs) and not StartsStr('record', Rhs) then Continue;
+      if StartsStr('interface', Rhs) or StartsStr('dispinterface', Rhs) then
+        Exit('interface');
+      if (StartsStr('class', Rhs) and not StartsStr('class of', Rhs)) or
+         StartsStr('record', Rhs) or StartsStr('object', Rhs) then
+        Exit('class');
+    end;
+  end;
+
+  // The kind is decided by the SECTION, not by comparing with the LSP's
+  // definition line: DelphiLSP answers GotoDefinition for a METHOD with its
+  // declaration in the class, but for a FREE routine with its implementation
+  // header - comparing with that line labelled the implementation of a free
+  // routine "Interface declaration" and its interface line "Declaration".
   function DetermineKind(const AFilePath: string; ALine, ACol: Integer;
-    const AOrigLine: string): string;
+    const AOrigLine: string; AImplLine: Integer; const ALines: TArray<string>): string;
   var
-    IsHeader, DotBefore: Boolean;
+    IsHeader, DotBefore, InImplementation, InDefFile: Boolean;
   begin
     IsHeader := LineStartsWithMethodKeyword(AOrigLine);
     DotBefore := (ACol > 0) and (ACol <= Length(AOrigLine)) and (AOrigLine[ACol] = '.');
+    InImplementation := (AImplLine >= 0) and (ALine > AImplLine);
+    InDefFile := SameText(ExpandFileName(AFilePath), ExpandFileName(ADefFilePath));
 
-    if IsHeader and DotBefore then
+    // Below 'implementation' an UNINDENTED header is a routine's
+    // implementation; an indented one is a method declared in a class body
+    // that lives in the implementation section.
+    if IsHeader and (DotBefore or (InImplementation and (AOrigLine <> '') and
+       not CharInSet(AOrigLine[1], [' ', #9]))) then
       Exit('Implementation');
 
     if IsHeader then
     begin
-      if SameText(ExpandFileName(AFilePath), ExpandFileName(ADefFilePath)) and (ALine = ADefLine) then
+      // any other header is a declaration - of an interface member, a
+      // class/record member, or a free routine
+      var TypeKind := EnclosingTypeKind(ALines, ALine);
+      if TypeKind = 'interface' then
         Exit('Interface declaration');
-      if IsKnownImplFile(AFilePath) then
+      if (TypeKind = 'class') or IsKnownImplFile(AFilePath) then
         Exit('Class declaration');
       Exit('Declaration');
     end;
 
-    // Non-header line: either a call / use, or a declaration within an
-    // interface/class block (e.g. 'property Bar: T read Bar;').
-    if SameText(ExpandFileName(AFilePath), ExpandFileName(ADefFilePath)) then
+    // Non-header line: a use in code, or a declaration-like use in the
+    // interface section (e.g. 'property Bar: T read Bar;').
+    if InDefFile and not InImplementation then
       Exit('Interface reference');
     Exit('Call');
   end;
@@ -1251,6 +1494,7 @@ begin
       except
         Continue;
       end;
+      var ImplLine := ImplementationLineOf(Lines);
 
       for var Edit in FE.Edits do
       begin
@@ -1277,7 +1521,7 @@ begin
         if FormHitKindAt(FE.FilePath, LineNo, StartCol, FormKind) then
           Item.Kind := FormKind
         else
-          Item.Kind := DetermineKind(FE.FilePath, LineNo, StartCol, OrigLine);
+          Item.Kind := DetermineKind(FE.FilePath, LineNo, StartCol, OrigLine, ImplLine, Lines);
 
         List.Add(Item);
       end;
@@ -1315,15 +1559,15 @@ begin
     VerifiedCount := 0;
     SkippedCount := 0;
 
-    FDialog.SetProgress(0, Length(ACandidates));
+    FHost.SetProgress(0, Length(ACandidates));
 
     for I := 0 to High(ACandidates) do
     begin
-      if FDialog.ScanCancelled then Break;
+      if FHost.ScanCancelled then Break;
       C := ACandidates[I];
-      FDialog.SetProgress(I + 1, Length(ACandidates));
+      FHost.SetProgress(I + 1, Length(ACandidates));
       if (I mod 3 = 0) then
-        FDialog.SetStatus(Format('Verifying %d/%d (ok:%d skip:%d)', [I + 1, Length(ACandidates), VerifiedCount, SkippedCount]));
+        FHost.SetStatus(Format('Verifying %d/%d (ok:%d skip:%d)', [I + 1, Length(ACandidates), VerifiedCount, SkippedCount]));
 
       // Open file on the LSP
       if not SameText(C.FilePath, LastOpenedFile) then
@@ -1422,7 +1666,7 @@ begin
         Inc(SkippedCount);
     end;
 
-    FDialog.SetProgress(Length(ACandidates), Length(ACandidates));
+    FHost.SetProgress(Length(ACandidates), Length(ACandidates));
 
     SetLength(Result.FileEdits, FileMap.Count);
     var Idx := 0;

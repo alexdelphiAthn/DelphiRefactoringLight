@@ -329,7 +329,7 @@ uses
   Vcl.Forms, Vcl.Controls, Vcl.StdCtrls, Vcl.ComCtrls, Vcl.ExtCtrls,
   Vcl.Graphics, Vcl.Dialogs,
   Lsp.Client, Lsp.Uri, Expert.LspManager,
-  Expert.EditorHelperIntf, Expert.UnitAvailability,
+  Expert.EditorHelperIntf, Expert.UnitAvailability, Expert.DiagStore,
   Expert.DfmEventCheck,   // MergeParamNames (shared with the DFM auto-fix)
   Expert.DialogHelper, Expert.IdeThemes, Expert.ListViewSort;
 
@@ -4219,6 +4219,10 @@ begin
             if not GLiveShutdown then
             begin
               var Diags := Client.GetErrorDiagnostics(AFile);
+              // Only a push for THIS analysis describes AContent; after a
+              // timeout the stored list may belong to an older state.
+              if Client.GetFileDiagnosticsVersion(AFile) > BeforeVer then
+                StoreDiagnostics(AFile, SrcLsp, AContent, Diags);
               NoteDiagStats(Diags, DSeen, DHandled, DCodes);
               DSig := DiagSignature(Diags);
               R := ResolveQuickFixes(AContent, Diags);
@@ -4532,6 +4536,9 @@ end;
 procedure LiveReportErrorDiags(const AFile, AContent: string;
   const ADiags: TArray<TLspErrorDiag>; const ASource: string);
 begin
+  // The raw diagnostics per source, bound to the content they describe -
+  // what the MCP bridge reports (the live checker keeps only the fixes).
+  StoreDiagnostics(AFile, ASource, AContent, ADiags);
   if GLive <> nil then
     GLive.ApplyExternalDiags(AFile, AContent, ADiags, ASource);
 end;

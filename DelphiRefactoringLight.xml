@@ -2,15 +2,12 @@
 <dih>
 	<!-- Win32 = 32-bit IDE (bin/bds.exe), Win64 = 64-bit IDE (bin64/bds.exe).
 	     Each gets its own build, its own BPL directory (Bpl vs Bpl/Win64)
-	     and its own registry branch ("Known Packages" vs "... x64"). -->
-	<entry id="global" description="Globale Suchpfade fuer Delphi Refactoring Light">
-		<paths>
-			<search platforms="Win32,Win64">
-				<path recursive="False">{#DcuTargetDir}</path>
-			</search>
-		</paths>
-	</entry>
-
+	     and its own registry branch ("Known Packages" vs "... x64").
+	     NO library search path entry for the package's own DCU folder: the
+	     IDE loads the BPL, nobody compiles against these units - and with
+	     the Release DCUs on the path DelphiLSP took the plugin's units from
+	     them (no debug info) and answered nothing for them while working on
+	     the plugin itself. -->
 	<entry id="DelphiRefactoringLight" description="Delphi Refactoring Light - Rename / Find References / Extract Method via DelphiLSP">
 		<paths>
 			<browsing platforms="Win32,Win64">

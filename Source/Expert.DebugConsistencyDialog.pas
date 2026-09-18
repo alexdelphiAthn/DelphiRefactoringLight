@@ -15,7 +15,19 @@ unit Expert.DebugConsistencyDialog;
 
 interface
 
+uses
+  Expert.DebugConsistency;
+
 procedure CheckDebugConsistency;
+
+/// <summary>The check's input for the ACTIVE project and configuration
+///  (options, search order, target, open files). MAIN THREAD - ToolsAPI.
+///  Also used by the MCP bridge.</summary>
+function GatherDebugCheckInput(out AInput: TDebugCheckInput;
+  out AError: string): Boolean;
+
+/// <summary>Human-readable names of the issue kinds / severities.</summary>
+function DebugIssueKindName(AKind: TDebugIssueKind): string;
 
 implementation
 
@@ -26,7 +38,7 @@ uses
   Vcl.Forms, Vcl.Controls, Vcl.StdCtrls, Vcl.ComCtrls, Vcl.ExtCtrls, Vcl.Clipbrd,
   ToolsAPI, DCCStrs, CommonOptionStrs,
   Expert.EditorHelperIntf, Expert.DialogHelper, Expert.IdeThemes,
-  Expert.ListViewSort, Expert.UnitIndex, Expert.DebugConsistency;
+  Expert.ListViewSort, Expert.UnitIndex;
 
 const
   KindNames: array[TDebugIssueKind] of string = ('duplicate source',
@@ -71,7 +83,13 @@ begin
   ADirs := ADirs + [ADir];
 end;
 
-function GatherInput(out AInput: TDebugCheckInput; out AError: string): Boolean;
+function DebugIssueKindName(AKind: TDebugIssueKind): string;
+begin
+  Result := KindNames[AKind];
+end;
+
+function GatherDebugCheckInput(out AInput: TDebugCheckInput;
+  out AError: string): Boolean;
 var
   Project: IOTAProject;
   Cfgs: IOTAProjectOptionsConfigurations;
@@ -484,7 +502,7 @@ var
   Issues: TArray<TDebugIssue>;
   Progress: TCheckProgressWindow;
 begin
-  if not GatherInput(Input, Err) then
+  if not GatherDebugCheckInput(Input, Err) then
   begin
     ShowThemedMessage(Err);
     Exit;

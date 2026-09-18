@@ -45,6 +45,7 @@ type
     end;
   private
     FLspExePath: string;
+    FExtraArgs: string;
     FProcessHandle: THandle;
     FStdinWrite: THandle;
     FStdoutRead: THandle;
@@ -67,6 +68,11 @@ type
     ///  (undeclared identifiers = code 'E2003'). Guarded by FInactiveRangesLock.</summary>
     FErrorDiags: TObjectDictionary<string, TList<TLspErrorDiag>>;
     FInactiveRangesLock: TCriticalSection;
+    // Partial-unit guard (see BeforePositionRequest)
+    FPosLock: TCriticalSection;
+    FLastPosFile: string;                        // file of the last position request
+    FDocLines: TDictionary<string, Integer>;     // UPPER path -> lines last sent
+    FAutoCompleteUnits: Boolean;
     FDiagnosticsCount: Integer;
     // Pushes per file (see GetFileDiagnosticsVersion).
     FFileDiagVersion: TDictionary<string, Integer>;
@@ -75,12 +81,26 @@ type
     FFilesWithDiagnostics: TDictionary<string, Boolean>;
 
     function NextRequestId: Integer;
+    procedure BeforePositionRequest(const AMethod: string; AParams: TJSONValue);
+    function LineCountOf(const AFilePath: string): Integer;
     procedure DispatchResponse(AMsg: TJSONObject);
     procedure HandleServerRequest(AMsg: TJSONObject);
     procedure HandlePublishDiagnostics(AParams: TJSONObject);
     procedure Log(const ADirection, AMethod, ABody: string);
   public
     constructor Create(const ALspExePath: string);
+    /// <summary>Extra command line for DelphiLsp.exe, e.g. '-LogModes 255'
+    ///  (writes %TEMP%\DelphiLSP\DelphiLSP.log). Set before Start.</summary>
+    property ExtraArgs: string read FExtraArgs write FExtraArgs;
+    /// <summary>MEASURED (DelphiLSP 13): a position request (definition,
+    ///  hover, ...) compiles the queried unit only UP TO THE CURSOR, and
+    ///  units USING it then see that partial state - after a query at a
+    ///  declaration in unit A, every query in a unit B that uses A answered
+    ///  null until A was queried again further down. With this on (default)
+    ///  the client queries the previous file once at its LAST line before
+    ///  the first position request in ANOTHER file, which restores it
+    ///  (a few ms per file switch). Off only for the A/B probe.</summary>
+    property AutoCompleteUnits: Boolean read FAutoCompleteUnits write FAutoCompleteUnits;
     destructor Destroy; override;
 
     /// <summary>Starts the LSP server as a subprocess.</summary>
@@ -301,6 +321,9 @@ begin
   FInactiveRanges := TObjectDictionary<string, TList<TLspRange>>.Create([doOwnsValues]);
   FErrorDiags := TObjectDictionary<string, TList<TLspErrorDiag>>.Create([doOwnsValues]);
   FInactiveRangesLock := TCriticalSection.Create;
+  FPosLock := TCriticalSection.Create;
+  FDocLines := TDictionary<string, Integer>.Create;
+  FAutoCompleteUnits := True;
   FFilesWithDiagnostics := TDictionary<string, Boolean>.Create;
   FFileDiagVersion := TDictionary<string, Integer>.Create;
   FProcessHandle := INVALID_HANDLE_VALUE;
@@ -337,6 +360,8 @@ begin
   FreeAndNil(FServerCapabilities);
   FPending.Free;
   FPendingLock.Free;
+  FreeAndNil(FDocLines);
+  FreeAndNil(FPosLock);
   FInactiveRanges.Free;
   FErrorDiags.Free;
   FInactiveRangesLock.Free;
@@ -468,6 +493,8 @@ begin
   SI.hStdError := hStdoutWrite; // redirect stderr too
 
   CmdLine := '"' + FLspExePath + '"';
+  if FExtraArgs <> '' then
+    CmdLine := CmdLine + ' ' + FExtraArgs;
 
   if not CreateProcess(nil, PChar(CmdLine), nil, nil, True,
     CREATE_NO_WINDOW, nil, nil, SI, PI) then
@@ -491,6 +518,66 @@ begin
   FReaderThread.Start;
 end;
 
+function TLspClient.LineCountOf(const AFilePath: string): Integer;
+begin
+  FPosLock.Enter;
+  try
+    if FDocLines.TryGetValue(UpperCase(ExpandFileName(AFilePath)), Result) then Exit;
+  finally
+    FPosLock.Leave;
+  end;
+  // never sent by us - the server has it from disk
+  Result := 0;
+  try
+    var S := TFile.ReadAllText(AFilePath);
+    Result := 1;
+    for var Ch in S do
+      if Ch = #10 then Inc(Result);
+  except
+  end;
+end;
+
+threadvar
+  GInUnitReset: Boolean;   // the reset probe itself must not trigger one
+
+procedure TLspClient.BeforePositionRequest(const AMethod: string; AParams: TJSONValue);
+var
+  Uri, FilePath, Prev: string;
+begin
+  if not FAutoCompleteUnits or GInUnitReset then Exit;
+  if not ((AMethod = 'textDocument/definition') or (AMethod = 'textDocument/hover') or
+          (AMethod = 'textDocument/implementation') or (AMethod = 'textDocument/references') or
+          (AMethod = 'textDocument/signatureHelp') or (AMethod = 'textDocument/completion') or
+          (AMethod = 'textDocument/prepareRename') or (AMethod = 'textDocument/rename') or
+          (AMethod = 'textDocument/typeDefinition') or (AMethod = 'textDocument/declaration')) then
+    Exit;
+  if not (AParams is TJSONObject) then Exit;
+  Uri := TJSONObject(AParams).GetValue<string>('textDocument.uri', '');
+  if Uri = '' then Exit;
+  FilePath := TLspUri.FileUriToPath(Uri);
+  FPosLock.Enter;
+  try
+    Prev := FLastPosFile;
+    FLastPosFile := FilePath;
+  finally
+    FPosLock.Leave;
+  end;
+  if (Prev = '') or SameText(ExpandFileName(Prev), ExpandFileName(FilePath)) then Exit;
+  // A query at the LAST line compiles the previous unit completely again.
+  var Lines := LineCountOf(Prev);
+  if Lines <= 0 then Exit;
+  GInUnitReset := True;
+  try
+    try
+      GotoDefinition(Prev, Lines - 1, 0);
+    except
+      // only a reset probe - its answer and failure do not matter
+    end;
+  finally
+    GInUnitReset := False;
+  end;
+end;
+
 function TLspClient.SendRequest(const AMethod: string; AParams: TJSONValue; ATimeoutMs: Cardinal): TJSONObject;
 var
   Id: Integer;
@@ -499,6 +586,7 @@ var
   WaitResult: TWaitResult;
   ErrorObj: TJSONObject;
 begin
+  BeforePositionRequest(AMethod, AParams);
   Id := NextRequestId;
 
   Msg := TJSONObject.Create;
@@ -559,6 +647,7 @@ var
   Msg: TJSONObject;
   Pending: TPendingRequest;
 begin
+  BeforePositionRequest(AMethod, AParams);
   Result := NextRequestId;
 
   Msg := TJSONObject.Create;
@@ -751,6 +840,15 @@ var
 begin
   AbsPath := ExpandFileName(AFilePath);
   Content := AContent;
+  var Lines := 1;
+  for var Ch in Content do
+    if Ch = #10 then Inc(Lines);
+  FPosLock.Enter;
+  try
+    FDocLines.AddOrSetValue(UpperCase(AbsPath), Lines);
+  finally
+    FPosLock.Leave;
+  end;
 
   TextDocObj := TJSONObject.Create;
   TextDocObj.AddPair('uri', TLspUri.PathToFileUri(AbsPath));

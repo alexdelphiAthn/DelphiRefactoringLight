@@ -47,8 +47,13 @@
         <DCC_S>false</DCC_S>
         <DCC_ImageBase>00400000</DCC_ImageBase>
         <SanitizedProjectName>DelphiRefactoringLight</SanitizedProjectName>
+        <VerInfo_IncludeVerInfo>true</VerInfo_IncludeVerInfo>
+        <VerInfo_MajorVer>1</VerInfo_MajorVer>
+        <VerInfo_MinorVer>0</VerInfo_MinorVer>
+        <VerInfo_Release>0</VerInfo_Release>
+        <VerInfo_Build>0</VerInfo_Build>
         <VerInfo_Locale>1031</VerInfo_Locale>
-        <VerInfo_Keys>CompanyName=;FileDescription=Delphi Refactoring Light;FileVersion=1.0.0.0;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProductName=DelphiRefactoringLight;ProductVersion=1.0.0.0;Comments=Rename / Find References / Extract Method via DelphiLSP</VerInfo_Keys>
+        <VerInfo_Keys>CompanyName=Sebastian Jaenicke;FileDescription=Delphi Refactoring Light;FileVersion=1.0.0.0;InternalName=DelphiRefactoringLight;LegalCopyright=Copyright (c) 2026 Sebastian Jaenicke, MPL 2.0;LegalTrademarks=;OriginalFilename=;ProductName=Delphi Refactoring Light;ProductVersion=1.0;Comments=https://github.com/jaenicke/DelphiRefactoringLight</VerInfo_Keys>
         <DCC_Namespace>System;Xml;Data;Datasnap;Web;Soap;Vcl;Vcl.Imaging;Vcl.Touch;Vcl.Samples;Vcl.Shell;$(DCC_Namespace)</DCC_Namespace>
         <GenDll>true</GenDll>
         <GenPackage>true</GenPackage>
@@ -176,6 +181,15 @@
         <DCCReference Include="..\Source\Expert.UsesCleanup.pas"/>
         <DCCReference Include="..\Source\Expert.DebugConsistency.pas"/>
         <DCCReference Include="..\Source\Expert.DebugConsistencyDialog.pas"/>
+        <DCCReference Include="..\Source\Expert.DiagStore.pas"/>
+        <DCCReference Include="..\Source\Expert.McpTools.pas"/>
+        <DCCReference Include="..\Source\Expert.McpServer.pas"/>
+        <DCCReference Include="..\Source\Mcp.Protocol.pas"/>
+        <DCCReference Include="..\Source\Mcp.PipeServer.pas"/>
+        <DCCReference Include="..\Source\Expert.McpMoreTools.pas"/>
+        <DCCReference Include="..\Source\Expert.McpLspTools.pas"/>
+        <DCCReference Include="..\Source\Expert.Version.pas"/>
+        <DCCReference Include="..\Source\Expert.PluginInfo.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

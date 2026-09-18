@@ -24,7 +24,8 @@ uses
   Expert.Shortcuts, Expert.OptionsPage, Expert.UnitIndex, Expert.AutoImport,
   Expert.StructureErrors, Expert.QuickFixMarkers, Expert.StatusWindow,
   Expert.BlameGutter, Expert.PluginSettings,
-  Expert.DialogHelper, Expert.ResourceMonitor;
+  Expert.DialogHelper, Expert.ResourceMonitor, Expert.McpServer,
+  Expert.PluginInfo;
 
 type
   TShortcutChangeHook = class
@@ -89,6 +90,9 @@ begin
   // Dockable status window. Registering here (inside Register) is what
   // lets the IDE restore it from a saved desktop layout.
   RegisterStatusWindow;
+  // Help > About entry (the splash screen entry is added earlier, from
+  // Expert.PluginInfo's initialization - see there).
+  RegisterAboutBox;
 
   // Unit rename watcher: offers rename when a unit is renamed in the IDE
   // (File > Save As etc.).
@@ -134,6 +138,9 @@ begin
   // into %TEMP%\RefactoringLight-resources.log - the numbers an
   // "out of memory" report needs (see Expert.ResourceMonitor).
   StartResourceMonitor;
+  // Named pipe for the MCP bridge (RefactoringLightMcp.exe): diagnostics
+  // and quick fixes for Claude Code & co, one pipe per IDE instance.
+  StartMcpServer;
 
   // On manual (re-)install inside a running IDE: show the restart hint.
   TRestartHint.Check;
@@ -145,6 +152,10 @@ finalization
   // Before anything else: hand the dockable form back to the IDE - it
   // must not outlive the BPL.
   UnregisterStatusWindow;
+  UnregisterAboutBox;
+  // Before the live checker: MCP requests read its data, and the server
+  // waits for every running request before it returns.
+  StopMcpServer;
   StopResourceMonitor;
   UninstallBlameGutter;
   UninstallQuickFixMarkers;

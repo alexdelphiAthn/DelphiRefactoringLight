@@ -133,6 +133,7 @@ type
     procedure OnExtractMethod(Sender: TObject);
     procedure OnCompletion(Sender: TObject);
     procedure OnShowStatus(Sender: TObject);
+    procedure OnShowMcpTools(Sender: TObject);
     procedure OnToggleBlame(Sender: TObject);
     procedure OnBlameCommit(Sender: TObject);
     procedure OnBlameList(Sender: TObject);
@@ -471,6 +472,7 @@ begin
   Plain(Root, 'Show blame for this file...', OnBlameList,          REQ_BLAMEVIEW);
   // Always available - it reports WHY something is not working.
   Plain(Root, 'Status window...',         OnShowStatus,           REQ_ALWAYS);
+  Plain(Root, 'MCP tools window...',      OnShowMcpTools,         REQ_ALWAYS);
 
   Result := Root;
 end;
@@ -1506,6 +1508,11 @@ end;
 procedure TContextMenuInstaller.OnShowStatus(Sender: TObject);
 begin
   ShowStatusWindow;
+end;
+
+procedure TContextMenuInstaller.OnShowMcpTools(Sender: TObject);
+begin
+  ShowMcpToolsWindow;
 end;
 
 procedure TContextMenuInstaller.OnBlameCommit(Sender: TObject);

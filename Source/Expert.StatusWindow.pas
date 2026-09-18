@@ -31,6 +31,19 @@ procedure RegisterStatusWindow;
 procedure UnregisterStatusWindow;
 /// <summary>Menu entry point: shows (and focuses) the status window.</summary>
 procedure ShowStatusWindow;
+/// <summary>Menu entry point: the MCP tools window - every tool the bridge
+///  offers, whether this IDE handles it, and what its calls did.</summary>
+procedure ShowMcpToolsWindow;
+
+type
+  TStatusRow = record
+    Caption, Value, Detail: string;
+  end;
+
+/// <summary>The rows the status window shows, collected NOW - whether the
+///  window is open or not (the MCP tool get_status). MAIN THREAD ONLY, like
+///  every ToolsAPI read in there.</summary>
+function StatusSnapshot: TArray<TStatusRow>;
 
 implementation
 
@@ -43,26 +56,26 @@ uses
   Expert.EditorHelperIntf, Expert.UnitIndex, Expert.LspManager,
   Expert.AutoImport, Expert.ContextMenu, Expert.IdeThemes, Expert.DialogHelper,
   Expert.BlameGutter, Expert.BlameDialogs, Expert.VcsBlame,
-  Expert.MessagesReader, Expert.StructureErrors, Lsp.Client;
+  Expert.MessagesReader, Expert.StructureErrors, Expert.McpServer, Lsp.Client,
+  Expert.Version, Expert.ListViewSort, Mcp.Protocol,
+  System.JSON, System.StrUtils, Vcl.StdCtrls;
 
 // TCustomFrame.Create does InitInheritedComponent(Self, TFrame) for every
-// descendant and RAISES EResNotFound when the class has no DFM resource -
-// so even a fully code-built frame needs one (Expert.StatusWindow.dfm is
-// an empty frame; all controls are still created in the constructor).
+// descendant and RAISES EResNotFound when NO class of its chain has a DFM
+// resource - so even a fully code-built frame needs one. Expert.StatusWindow
+// .dfm is an empty frame of the common BASE class TRlDockFrame: one
+// resource serves every dockable window of this unit (all controls are
+// still created in the constructors).
 {$R *.dfm}
 
 type
-  TStatusRow = record
-    Caption, Value, Detail: string;
+  TRlDockFrame = class(TFrame)
   end;
 
-  // The frame the IDE embeds into its dockable form.
-  TStatusFrame = class(TFrame)
+  // Collects the rows. Separate from the frame, so the MCP bridge can ask
+  // for the same rows while no status window is open (StatusSnapshot).
+  TStatusCollector = class
   private
-    FList: TListView;
-    FPopup: TPopupMenu;
-    FMniAdjust: TMenuItem;
-    FTimer: TTimer;
     // Collected rows of the CURRENT tick. The row SET is fixed (same
     // count, same order, always) - only the cell texts change, so the
     // refresh can write single cells instead of rebuilding the list.
@@ -78,19 +91,64 @@ type
     FResValid: Boolean;
     FMemText, FMemDetail: string;  // refreshed every 10th tick (walks caches)
     FMemValid: Boolean;
-    procedure DoTick(Sender: TObject);
     procedure Row(const ACaption, AValue, ADetail: string);
+  public
+    /// <summary>One refresh round: the expensive rows re-sample every Nth
+    ///  call, so calling it about once a second is what it expects.</summary>
+    procedure Collect;
+  end;
+
+  // The frame the IDE embeds into its dockable form.
+  TStatusFrame = class(TRlDockFrame)
+  private
+    FList: TListView;
+    FPopup: TPopupMenu;
+    FMniAdjust: TMenuItem;
+    FTimer: TTimer;
+    FC: TStatusCollector;
+    procedure DoTick(Sender: TObject);
     procedure DoListDblClick(Sender: TObject);
     procedure DoAdjustBlameClick(Sender: TObject);
     procedure DoPopup(Sender: TObject);
-    procedure Collect;
     procedure Apply;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+  // The MCP tools window: one row per tool of the bridge's list.
+  TMcpToolsFrame = class(TRlDockFrame)
+  private type
+    TToolDef = record
+      Name, Description: string;
+      Bridge: Boolean;   // handled by the bridge itself, never reaches an IDE
+    end;
+  private
+    FHeader: TLabel;
+    FList: TListView;
+    FDetail: TMemo;
+    FTimer: TTimer;
+    FDefs: TArray<TToolDef>;
+    FDetailFor: string;    // tool + stats shown in the memo (skip rewrites)
+    procedure LoadDefs;
+    procedure DoTick(Sender: TObject);
+    procedure DoSelect(Sender: TObject; Item: TListItem; Selected: Boolean);
+    procedure RefreshRows;
+    procedure ShowDetail;
+    function StatOf(const AName: string; const AStats: TArray<TMcpToolStat>;
+      out AStat: TMcpToolStat): Boolean;
   public
     constructor Create(AOwner: TComponent); override;
   end;
 
+  // One class for both windows - they differ only in caption, identifier
+  // and frame.
   TStatusDockable = class(TInterfacedObject, INTACustomDockableForm)
+  private
+    FCaption, FIdent: string;
+    FFrameClass: TCustomFrameClass;
   public
+    constructor Create(const ACaption, AIdent: string; AFrameClass: TCustomFrameClass);
     function GetCaption: string;
     function GetIdentifier: string;
     function GetFrameClass: TCustomFrameClass;
@@ -112,6 +170,9 @@ var
   GDockable: INTACustomDockableForm;
   GForm: TCustomForm;
   GRegistered: Boolean;
+  GToolsDockable: INTACustomDockableForm;
+  GToolsForm: TCustomForm;
+  GToolsRegistered: Boolean;
 
 { TStatusFrame }
 
@@ -119,6 +180,7 @@ constructor TStatusFrame.Create(AOwner: TComponent);
 begin
   inherited;
   Name := '';   // the IDE names the embedded instance
+  FC := TStatusCollector.Create;
 
   FList := TListView.Create(Self);
   FList.Parent := Self;
@@ -150,11 +212,18 @@ begin
   FTimer.Interval := 1000;
   FTimer.OnTimer := DoTick;
   FTimer.Enabled := True;
-  Collect;
+  FC.Collect;
   Apply;
 end;
 
-procedure TStatusFrame.Row(const ACaption, AValue, ADetail: string);
+destructor TStatusFrame.Destroy;
+begin
+  FreeAndNil(FTimer);
+  inherited;
+  FreeAndNil(FC);
+end;
+
+procedure TStatusCollector.Row(const ACaption, AValue, ADetail: string);
 begin
   if FRowCount >= Length(FRows) then
     SetLength(FRows, FRowCount + 8);
@@ -172,7 +241,11 @@ end;
 procedure TStatusFrame.DoListDblClick(Sender: TObject);
 begin
   if TStatusFrame_IsBlameRow(FList.Selected) then
-    AdjustBlameColumn;
+    AdjustBlameColumn
+  else if (FList.Selected <> nil) and
+    (SameText(Trim(FList.Selected.Caption), 'MCP bridge endpoint') or
+     SameText(Trim(FList.Selected.Caption), 'Claude Code')) then
+    ShowMcpToolsWindow;
 end;
 
 procedure TStatusFrame.DoAdjustBlameClick(Sender: TObject);
@@ -195,18 +268,18 @@ var
   I: Integer;
   It: TListItem;
 begin
-  if FList.Items.Count <> FRowCount then
+  if FList.Items.Count <> FC.FRowCount then
   begin
     // Structural change (should not happen - the row set is fixed).
     FList.Items.BeginUpdate;
     try
       FList.Items.Clear;
-      for I := 0 to FRowCount - 1 do
+      for I := 0 to FC.FRowCount - 1 do
       begin
         It := FList.Items.Add;
-        It.Caption := FRows[I].Caption;
-        It.SubItems.Add(FRows[I].Value);
-        It.SubItems.Add(FRows[I].Detail);
+        It.Caption := FC.FRows[I].Caption;
+        It.SubItems.Add(FC.FRows[I].Value);
+        It.SubItems.Add(FC.FRows[I].Detail);
       end;
     finally
       FList.Items.EndUpdate;
@@ -214,17 +287,17 @@ begin
     Exit;
   end;
 
-  for I := 0 to FRowCount - 1 do
+  for I := 0 to FC.FRowCount - 1 do
   begin
     It := FList.Items[I];
-    if It.Caption <> FRows[I].Caption then
-      It.Caption := FRows[I].Caption;
+    if It.Caption <> FC.FRows[I].Caption then
+      It.Caption := FC.FRows[I].Caption;
     if It.SubItems.Count > 0 then
     begin
-      if It.SubItems[0] <> FRows[I].Value then
-        It.SubItems[0] := FRows[I].Value;
-      if (It.SubItems.Count > 1) and (It.SubItems[1] <> FRows[I].Detail) then
-        It.SubItems[1] := FRows[I].Detail;
+      if It.SubItems[0] <> FC.FRows[I].Value then
+        It.SubItems[0] := FC.FRows[I].Value;
+      if (It.SubItems.Count > 1) and (It.SubItems[1] <> FC.FRows[I].Detail) then
+        It.SubItems[1] := FC.FRows[I].Detail;
     end;
   end;
 end;
@@ -273,7 +346,7 @@ begin
      MBText(Idx.ProjectLayerBytes), BlFiles, BlLines]);
 end;
 
-procedure TStatusFrame.Collect;
+procedure TStatusCollector.Collect;
 var
   Client: TLspClient;
   LiveFile, S, Detail, DiagCodes: string;
@@ -286,6 +359,17 @@ begin
   // FIXED row set: every branch below fills the same rows in the same
   // order, so Apply never has to restructure the list.
   FRowCount := 0;
+
+  // ---- the plugin itself ---------------------------------------------------
+  // First row: which build is actually loaded answers half of all "does not
+  // work for me" reports.
+  try
+    Detail := GetModuleName(HInstance) + ', built ' +
+      FormatDateTime('yyyy-mm-dd hh:nn', TFile.GetLastWriteTime(GetModuleName(HInstance)));
+  except
+    Detail := GetModuleName(HInstance);
+  end;
+  Row(PluginName, 'version ' + PluginVersion, Detail);
 
   // ---- process resources --------------------------------------------------
   // First, because it is what the next "out of memory" report needs:
@@ -325,6 +409,10 @@ begin
   // anonymous method - otherwise "no entry" looks exactly like "broken".
   Row('Completion: generated entries', CompletionGenerationNote,
     'last code completion call; history in %TEMP%\RefactoringLight-completion.log');
+  Row('MCP bridge endpoint', McpServerStatus,
+    McpServerPipe + ' - used by RefactoringLightMcp.exe (Claude Code)');
+  S := McpConnectionStatus(Detail);
+  Row('  Claude Code', S, Detail);
 
   // ---- identifier index ---------------------------------------------------
   if TUnitIndex.Instance.Ready then S := 'ready' else S := 'building...';
@@ -522,31 +610,294 @@ begin
   var GdiG := GdiGuard(gsStatusTick);
   // Window/state refresh only from a plain WM_TIMER tick (deadlock rule).
   if not Visible then Exit;
-  Inc(FTicks);
+  Inc(FC.FTicks);
   try
-    Collect;
+    FC.Collect;
     Apply;   // writes only what changed - no flicker, keeps the selection
   except
     // a status display must never disturb the IDE
   end;
 end;
 
+var
+  GSnapshot: TStatusCollector = nil;
+
+function StatusSnapshot: TArray<TStatusRow>;
+begin
+  // Its own collector: the window's one ticks with the window, this one
+  // with the requests - each keeps its own "every Nth round" rhythm.
+  if GSnapshot = nil then GSnapshot := TStatusCollector.Create;
+  Inc(GSnapshot.FTicks);
+  GSnapshot.Collect;
+  Result := Copy(GSnapshot.FRows, 0, GSnapshot.FRowCount);
+end;
+
+{ TMcpToolsFrame }
+
+const
+  // column indexes of the tools list (0 = caption)
+  tcHandled = 0; tcCalls = 1; tcErrors = 2; tcLast = 3; tcLastMs = 4;
+  tcAvgMax = 5; tcResult = 6; tcDescription = 7;
+
+constructor TMcpToolsFrame.Create(AOwner: TComponent);
+
+  procedure Col(const ACaption: string; AWidth: Integer; ARight: Boolean = False);
+  begin
+    var C := FList.Columns.Add;
+    C.Caption := ACaption;
+    C.Width := AWidth;
+    if ARight then C.Alignment := taRightJustify;
+  end;
+
+begin
+  inherited;
+  Name := '';
+  FHeader := TLabel.Create(Self);
+  FHeader.Parent := Self;
+  FHeader.Align := alTop;
+  FHeader.AutoSize := False;   // see CLAUDE.md: AutoSize + alTop misjudges
+  FHeader.Height := 22;
+  FHeader.Layout := tlCenter;
+  FHeader.Transparent := True;
+  FHeader.AlignWithMargins := True;
+  FHeader.Margins.SetBounds(6, 2, 6, 0);
+
+  FDetail := TMemo.Create(Self);
+  FDetail.Parent := Self;
+  FDetail.Align := alBottom;
+  FDetail.Height := 90;
+  FDetail.ReadOnly := True;
+  FDetail.ScrollBars := ssVertical;
+  FDetail.WordWrap := True;
+
+  var Split := TSplitter.Create(Self);
+  Split.Parent := Self;
+  Split.Align := alBottom;
+  Split.Top := FDetail.Top - 1;   // above the memo, not below it
+
+  FList := TListView.Create(Self);
+  FList.Parent := Self;
+  FList.Align := alClient;
+  FList.ViewStyle := vsReport;
+  FList.ReadOnly := True;
+  FList.RowSelect := True;
+  FList.GridLines := True;
+  FList.HideSelection := False;
+  FList.OnSelectItem := DoSelect;
+  Col('Tool', 150);
+  Col('Handled by', 70);
+  Col('Calls', 50, True);
+  Col('Errors', 50, True);
+  Col('Last call', 70);
+  Col('Last ms', 60, True);
+  Col('Avg / max ms', 90, True);
+  Col('Last result', 200);
+  Col('Description', 500);
+  EnableListViewSorting(FList);
+
+  LoadDefs;
+  FTimer := TTimer.Create(Self);
+  FTimer.Interval := 1000;
+  FTimer.OnTimer := DoTick;
+  FTimer.Enabled := True;
+  RefreshRows;
+end;
+
+procedure TMcpToolsFrame.LoadDefs;
+var
+  Arr: TJSONArray;
+begin
+  // The bridge's list is compiled into this plugin as well (Mcp.Protocol) -
+  // the same definitions the IDE serves to the bridge.
+  Arr := McpToolDefinitions;
+  try
+    SetLength(FDefs, Arr.Count);
+    for var I := 0 to Arr.Count - 1 do
+    begin
+      var O := Arr.Items[I] as TJSONObject;
+      FDefs[I].Name := O.GetValue<string>('name', '');
+      FDefs[I].Description := O.GetValue<string>('description', '');
+      FDefs[I].Bridge := not McpHandlesTool(FDefs[I].Name);
+    end;
+  finally
+    Arr.Free;
+  end;
+end;
+
+function TMcpToolsFrame.StatOf(const AName: string;
+  const AStats: TArray<TMcpToolStat>; out AStat: TMcpToolStat): Boolean;
+begin
+  for var S in AStats do
+    if S.Name = AName then
+    begin
+      AStat := S;
+      Exit(True);
+    end;
+  AStat := Default(TMcpToolStat);
+  Result := False;
+end;
+
+procedure TMcpToolsFrame.DoTick(Sender: TObject);
+begin
+  // plain WM_TIMER tick - state reads only, cells written when changed
+  if not Visible then Exit;
+  try
+    RefreshRows;
+  except
+    // a status display must never disturb the IDE
+  end;
+end;
+
+procedure TMcpToolsFrame.DoSelect(Sender: TObject; Item: TListItem;
+  Selected: Boolean);
+begin
+  ShowDetail;
+end;
+
+procedure TMcpToolsFrame.RefreshRows;
+
+  procedure SetCell(AItem: TListItem; ACol: Integer; const AText: string);
+  begin
+    while AItem.SubItems.Count <= ACol do AItem.SubItems.Add('');
+    if AItem.SubItems[ACol] <> AText then AItem.SubItems[ACol] := AText;
+  end;
+
+var
+  Stats: TArray<TMcpToolStat>;
+  St: TMcpToolStat;
+  Detail, Conn: string;
+  TotalCalls, TotalErrors: Integer;
+begin
+  Stats := McpToolStats;
+  TotalCalls := 0;
+  TotalErrors := 0;
+  for var S in Stats do
+  begin
+    Inc(TotalCalls, S.Calls);
+    Inc(TotalErrors, S.Errors);
+  end;
+  Conn := McpConnectionStatus(Detail);
+  var H := Format('%d tools  |  %d call(s), %d error(s) this session  |  ' +
+    'Claude Code: %s', [Length(FDefs), TotalCalls, TotalErrors, Conn]);
+  if FHeader.Caption <> H then FHeader.Caption := H;
+
+  if FList.Items.Count <> Length(FDefs) then
+  begin
+    FList.Items.BeginUpdate;
+    try
+      FList.Items.Clear;
+      for var I := 0 to High(FDefs) do
+      begin
+        var It := FList.Items.Add;
+        It.Caption := FDefs[I].Name;
+        // rows map to FDefs through Data, never Index (sortable list)
+        It.Data := Pointer(NativeInt(I));
+      end;
+    finally
+      FList.Items.EndUpdate;
+    end;
+  end;
+
+  for var K := 0 to FList.Items.Count - 1 do
+  begin
+    var It := FList.Items[K];
+    var D := FDefs[NativeInt(It.Data)];
+    if D.Bridge then SetCell(It, tcHandled, 'bridge')
+    else SetCell(It, tcHandled, 'IDE');
+    if StatOf(D.Name, Stats, St) then
+    begin
+      SetCell(It, tcCalls, IntToStr(St.Calls));
+      SetCell(It, tcErrors, IfThen(St.Errors > 0, IntToStr(St.Errors), ''));
+      SetCell(It, tcLast, FormatDateTime('hh:nn:ss', St.LastTime));
+      if St.Running > 0 then
+      begin
+        SetCell(It, tcLastMs, 'running');
+        SetCell(It, tcResult, 'running...');
+      end
+      else
+      begin
+        SetCell(It, tcLastMs, IntToStr(St.LastMs));
+        if St.LastOk then SetCell(It, tcResult, 'ok')
+        else SetCell(It, tcResult, 'ERROR: ' + St.LastError);
+      end;
+      var Done := St.Calls - St.Running;
+      if Done > 0 then
+        SetCell(It, tcAvgMax, Format('%d / %d', [St.TotalMs div Done, St.MaxMs]))
+      else
+        SetCell(It, tcAvgMax, '');
+    end
+    else
+    begin
+      SetCell(It, tcCalls, IfThen(D.Bridge, '-', '0'));
+      SetCell(It, tcErrors, '');
+      SetCell(It, tcLast, '');
+      SetCell(It, tcLastMs, '');
+      SetCell(It, tcAvgMax, '');
+      SetCell(It, tcResult, IfThen(D.Bridge,
+        'answered by the bridge, not counted here', ''));
+    end;
+    SetCell(It, tcDescription, D.Description);
+  end;
+  ShowDetail;
+end;
+
+procedure TMcpToolsFrame.ShowDetail;
+var
+  St: TMcpToolStat;
+  Text: string;
+begin
+  if FList.Selected = nil then
+  begin
+    Text := 'Select a tool to see its full description and its last error.' +
+      sLineBreak + 'The tools are used by Claude Code through the MCP bridge ' +
+      '(RefactoringLightMcp.exe); "IDE" tools run in this IDE, "bridge" tools ' +
+      'in the bridge itself (choosing the IDE).';
+  end
+  else
+  begin
+    var D := FDefs[NativeInt(FList.Selected.Data)];
+    Text := D.Name + sLineBreak + D.Description;
+    if StatOf(D.Name, McpToolStats, St) then
+    begin
+      Text := Text + sLineBreak + sLineBreak + Format('%d call(s), %d error(s), ' +
+        'last at %s', [St.Calls, St.Errors, FormatDateTime('hh:nn:ss', St.LastTime)]);
+      if St.LastError <> '' then
+        Text := Text + sLineBreak + 'Last error: ' + St.LastError;
+    end;
+  end;
+  // only when it changed - rewriting would reset the user's scroll/selection
+  if Text <> FDetailFor then
+  begin
+    FDetailFor := Text;
+    FDetail.Text := Text;
+  end;
+end;
+
 { TStatusDockable }
+
+constructor TStatusDockable.Create(const ACaption, AIdent: string;
+  AFrameClass: TCustomFrameClass);
+begin
+  inherited Create;
+  FCaption := ACaption;
+  FIdent := AIdent;
+  FFrameClass := AFrameClass;
+end;
 
 function TStatusDockable.GetCaption: string;
 begin
-  Result := 'Refactoring Light Status';
+  Result := FCaption;
 end;
 
 function TStatusDockable.GetIdentifier: string;
 begin
   // Section name in the desktop state file - do not translate or change.
-  Result := 'RefactoringLightStatus';
+  Result := FIdent;
 end;
 
 function TStatusDockable.GetFrameClass: TCustomFrameClass;
 begin
-  Result := TStatusFrame;
+  Result := FFrameClass;
 end;
 
 procedure TStatusDockable.FrameCreated(AFrame: TCustomFrame);
@@ -617,74 +968,77 @@ end;
 
 { registration }
 
-procedure RegisterStatusWindow;
+procedure RegisterDock(var ADock: INTACustomDockableForm; var ARegistered: Boolean;
+  const ACaption, AIdent: string; AFrameClass: TCustomFrameClass);
 var
   Svc: INTAServices;
 begin
-  if GRegistered then Exit;
+  if ARegistered then Exit;
   if not Supports(BorlandIDEServices, INTAServices, Svc) then Exit;
-  GDockable := TStatusDockable.Create;
+  ADock := TStatusDockable.Create(ACaption, AIdent, AFrameClass);
   try
     // Registering (rather than only creating) lets the IDE restore the
     // window from a saved desktop layout.
-    Svc.RegisterDockableForm(GDockable);
-    GRegistered := True;
+    Svc.RegisterDockableForm(ADock);
+    ARegistered := True;
   except
-    GDockable := nil;
+    ADock := nil;
   end;
 end;
 
-procedure UnregisterStatusWindow;
+procedure UnregisterDock(var ADock: INTACustomDockableForm; var AForm: TCustomForm;
+  var ARegistered: Boolean);
 var
   Svc: INTAServices;
 begin
   // MANDATORY before the BPL unloads - the IDE would otherwise hold a
   // reference to code that is no longer mapped.
   try
-    if GForm <> nil then
+    if AForm <> nil then
     begin
-      GForm.Free;
-      GForm := nil;
+      AForm.Free;
+      AForm := nil;
     end;
   except
-    GForm := nil;
+    AForm := nil;
   end;
   try
-    if GRegistered and Supports(BorlandIDEServices, INTAServices, Svc) then
-      Svc.UnregisterDockableForm(GDockable);
+    if ARegistered and Supports(BorlandIDEServices, INTAServices, Svc) then
+      Svc.UnregisterDockableForm(ADock);
   except
   end;
-  GRegistered := False;
-  GDockable := nil;
+  ARegistered := False;
+  ADock := nil;
 end;
 
-procedure ShowStatusWindow;
+procedure ShowDock(var ADock: INTACustomDockableForm; var AForm: TCustomForm;
+  const AWhat: string);
 var
   Svc: INTAServices;
   Why: string;
 begin
   Why := '';
   try
-    if GDockable = nil then
+    if ADock = nil then
       RegisterStatusWindow;
-    if GDockable = nil then
+    if ADock = nil then
       Why := 'the dockable form could not be registered (INTAServices missing?)'
     else
     begin
-      if GForm = nil then
+      if AForm = nil then
       begin
         if Supports(BorlandIDEServices, INTAServices, Svc) then
-          GForm := Svc.CreateDockableForm(GDockable)
+          AForm := Svc.CreateDockableForm(ADock)
         else
           Why := 'INTAServices not available';
       end;
-      if (Why = '') and (GForm = nil) then
+      if (Why = '') and (AForm = nil) then
         Why := 'CreateDockableForm returned nil';
     end;
-    if GForm <> nil then
+    if AForm <> nil then
     begin
-      GForm.Show;
-      GForm.BringToFront;
+      AForm.Show;
+      AForm.BringToFront;
     end;
   except
     on E: Exception do
@@ -692,7 +1046,32 @@ begin
   end;
   // A menu entry that does nothing at all is the worst outcome - say why.
   if Why <> '' then
-    ShowThemedMessage('The status window could not be opened.'#13#10#13#10 + Why);
+    ShowThemedMessage('The ' + AWhat + ' could not be opened.'#13#10#13#10 + Why);
+end;
+
+procedure RegisterStatusWindow;
+begin
+  RegisterDock(GDockable, GRegistered, 'Refactoring Light Status',
+    'RefactoringLightStatus', TStatusFrame);
+  RegisterDock(GToolsDockable, GToolsRegistered, 'Refactoring Light MCP Tools',
+    'RefactoringLightMcpTools', TMcpToolsFrame);
+end;
+
+procedure UnregisterStatusWindow;
+begin
+  FreeAndNil(GSnapshot);
+  UnregisterDock(GToolsDockable, GToolsForm, GToolsRegistered);
+  UnregisterDock(GDockable, GForm, GRegistered);
+end;
+
+procedure ShowStatusWindow;
+begin
+  ShowDock(GDockable, GForm, 'status window');
+end;
+
+procedure ShowMcpToolsWindow;
+begin
+  ShowDock(GToolsDockable, GToolsForm, 'MCP tools window');
 end;
 
 end.

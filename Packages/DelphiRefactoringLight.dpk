@@ -115,6 +115,15 @@ contains
   Expert.FindOriginalSymbolWizard in '..\Source\Expert.FindOriginalSymbolWizard.pas',
   Expert.UsesCleanup in '..\Source\Expert.UsesCleanup.pas',
   Expert.DebugConsistency in '..\Source\Expert.DebugConsistency.pas',
-  Expert.DebugConsistencyDialog in '..\Source\Expert.DebugConsistencyDialog.pas';
+  Expert.DebugConsistencyDialog in '..\Source\Expert.DebugConsistencyDialog.pas',
+  Expert.DiagStore in '..\Source\Expert.DiagStore.pas',
+  Expert.McpTools in '..\Source\Expert.McpTools.pas',
+  Expert.McpServer in '..\Source\Expert.McpServer.pas',
+  Mcp.Protocol in '..\Source\Mcp.Protocol.pas',
+  Mcp.PipeServer in '..\Source\Mcp.PipeServer.pas',
+  Expert.McpMoreTools in '..\Source\Expert.McpMoreTools.pas',
+  Expert.McpLspTools in '..\Source\Expert.McpLspTools.pas',
+  Expert.Version in '..\Source\Expert.Version.pas',
+  Expert.PluginInfo in '..\Source\Expert.PluginInfo.pas';
 
 end.

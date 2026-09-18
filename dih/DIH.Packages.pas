@@ -10,7 +10,7 @@ unit DIH.Packages;
 interface
 
 uses
-  System.SysUtils, System.Win.Registry, Winapi.Windows,
+  System.SysUtils, System.Classes, System.Win.Registry, Winapi.Windows,
   DIH.Types, DIH.Logger, DIH.Placeholders;
 
 type
@@ -19,6 +19,8 @@ type
     FLogger: TDIHLogger;
     FResolver: TDIHPlaceholderResolver;
     function GetKnownPackagesKey(APlatform: TDIHPlatform): string;
+    function ExpandRegisteredPath(const AValueName: string): string;
+    procedure RemoveStaleEntries(AReg: TRegistry; const AKeepName, ATargetFile: string);
   public
     constructor Create(ALogger: TDIHLogger; AResolver: TDIHPlaceholderResolver);
     procedure RegisterPackages(const APackages: TArray<TDIHPackageEntry>; APlatform: TDIHPlatform);
@@ -60,6 +62,83 @@ begin
     Result := Result + ' x64';
 end;
 
+// A Known Packages value name as the IDE reads it: $(BDSCOMMONDIR), $(BDS),
+// $(BDSBIN) and environment variables expanded.
+function TDIHPackageManager.ExpandRegisteredPath(const AValueName: string): string;
+var
+  Common, Root: string;
+  Buffer: array[0..4095] of Char;
+begin
+  Common := FResolver.Resolve('{#BDSCommonDir}');
+  Root := ExcludeTrailingPathDelimiter(FResolver.Resolve('{#BDSRootDir}'));
+  Result := StringReplace(AValueName, '$(BDSCOMMONDIR)', Common, [rfReplaceAll, rfIgnoreCase]);
+  Result := StringReplace(Result, '$(BDSBIN)', Root + '\bin', [rfReplaceAll, rfIgnoreCase]);
+  Result := StringReplace(Result, '$(BDS)', Root, [rfReplaceAll, rfIgnoreCase]);
+  if Pos('%', Result) > 0 then
+    if ExpandEnvironmentStrings(PChar(Result), @Buffer[0], Length(Buffer)) > 0 then
+      Result := string(Buffer);
+end;
+
+// Package base name without the {$LIBSUFFIX} version digits:
+// 'DelphiRefactoringLight370.bpl' and 'DelphiRefactoringLight.bpl' both
+// give 'DelphiRefactoringLight'.
+function PackageBaseName(const AFileName: string): string;
+begin
+  Result := ChangeFileExt(ExtractFileName(AFileName), '');
+  while (Result <> '') and CharInSet(Result[Length(Result)], ['0'..'9']) do
+    SetLength(Result, Length(Result) - 1);
+end;
+
+// Removes what would make the IDE load the package twice, or ask about a
+// package that is gone ("... could not be loaded - load it next time?" at
+// every start, which also blocks an unattended IDE start):
+//  * DUPLICATES - another spelling of the SAME file ("$(BDSCOMMONDIR)\Bpl\X"
+//    next to "C:\Users\Public\...\Bpl\X"),
+//  * STALE VARIANTS - the same package base name with another (or no)
+//    version suffix in the SAME folder, e.g. 'DelphiRefactoringLight.bpl'
+//    left behind by a build without {$LIBSUFFIX AUTO}.
+// Only the folder of the package being registered is touched, so packages of
+// other vendors and other IDE versions are never affected.
+procedure TDIHPackageManager.RemoveStaleEntries(AReg: TRegistry;
+  const AKeepName, ATargetFile: string);
+var
+  Names: TStringList;
+  Target, TargetDir, Base, Expanded: string;
+begin
+  Target := ExpandFileName(ATargetFile);
+  TargetDir := ExtractFilePath(Target);
+  Base := PackageBaseName(Target);
+  if Base = '' then Exit;
+  Names := TStringList.Create;
+  try
+    AReg.GetValueNames(Names);
+    for var N in Names do
+    begin
+      if SameText(N, AKeepName) then Continue;
+      Expanded := ExpandFileName(ExpandRegisteredPath(N));
+      var Why := '';
+      if SameText(Expanded, Target) then
+        Why := 'duplicate entry for the same file'
+      else if SameText(ExtractFilePath(Expanded), TargetDir) and
+              SameText(PackageBaseName(Expanded), Base) and
+              SameText(ExtractFileExt(Expanded), '.bpl') then
+      begin
+        if FileExists(Expanded) then
+          Why := 'other version of the same package in the same folder'
+        else
+          Why := 'stale entry, the file no longer exists';
+      end;
+      if Why <> '' then
+      begin
+        AReg.DeleteValue(N);
+        FLogger.Detail('Removed Known Packages entry %s (%s)', [N, Why]);
+      end;
+    end;
+  finally
+    Names.Free;
+  end;
+end;
+
 procedure TDIHPackageManager.RegisterPackages(const APackages: TArray<TDIHPackageEntry>;
   APlatform: TDIHPlatform);
 var
@@ -85,6 +164,7 @@ begin
           Continue;
 
         BplPath := FResolver.ResolveKeepEnvVars(Pkg.BplPath);
+        RemoveStaleEntries(Reg, BplPath, FResolver.Resolve(Pkg.BplPath));
         Reg.WriteString(BplPath, Pkg.Description);
         FLogger.Detail('Registered package: %s (%s)', [ExtractFileName(BplPath), Pkg.Description]);
       end;

@@ -108,6 +108,19 @@ function MapBufferToDiskLines(const ADisk, ABuf: TArray<string>): TArray<Integer
 ///  disk. Never blocks: a miss just means "not (yet) available".</summary>
 function BlameForFile(const AFile: string; out ALines: TBlameLines): Boolean;
 
+/// <summary>True when the last load for AFile has FINISHED without data
+///  (untracked file, client error) - BlameStatus says why. Lets a caller
+///  that waits for a result stop instead of running into its timeout.
+///  </summary>
+function BlameLoadFailed(const AFile: string): Boolean;
+
+/// <summary>Output of a VCS client as text: UTF-8, but any LINE that is not
+///  valid UTF-8 is decoded as ANSI. A diff reproduces the bytes of the
+///  files it shows, and an ANSI-encoded source ('Größe' in cp1252) made the
+///  UTF-8 decoder raise for the WHOLE output. Pure and tested.
+///  </summary>
+function DecodeVcsOutput(const ABytes: TBytes; ACount: Integer): string;
+
 /// <summary>Starts a background load for AFile unless one is running or
 /// the cached data is still current. Cheap to call from a paint handler
 /// or a timer tick.</summary>
@@ -606,6 +619,69 @@ end;
 //  Running the VCS client
 // ---------------------------------------------------------------------------
 
+// Well-formed UTF-8 (no overlongs, no surrogates, <= U+10FFFF)? Checked by
+// hand: the RTL decoders either replace silently or fail per call, which
+// cannot tell a line apart.
+function IsValidUtf8(const B: TBytes; AStart, ALen: Integer): Boolean;
+var
+  I, Stop, Need: Integer;
+  C: Byte;
+  CP: Cardinal;
+begin
+  I := AStart;
+  Stop := AStart + ALen;
+  while I < Stop do
+  begin
+    C := B[I];
+    if C < $80 then begin Inc(I); Continue; end;
+    if (C and $E0) = $C0 then begin Need := 1; CP := C and $1F; end
+    else if (C and $F0) = $E0 then begin Need := 2; CP := C and $0F; end
+    else if (C and $F8) = $F0 then begin Need := 3; CP := C and $07; end
+    else Exit(False);
+    if I + Need >= Stop then Exit(False);
+    for var K := 1 to Need do
+    begin
+      if (B[I + K] and $C0) <> $80 then Exit(False);
+      CP := (CP shl 6) or (B[I + K] and $3F);
+    end;
+    case Need of
+      1: if CP < $80 then Exit(False);
+      2: if (CP < $800) or ((CP >= $D800) and (CP <= $DFFF)) then Exit(False);
+      3: if (CP < $10000) or (CP > $10FFFF) then Exit(False);
+    end;
+    Inc(I, Need + 1);
+  end;
+  Result := True;
+end;
+
+function DecodeVcsOutput(const ABytes: TBytes; ACount: Integer): string;
+var
+  SB: TStringBuilder;
+  Start, I, Len: Integer;
+begin
+  if ACount <= 0 then Exit('');
+  if IsValidUtf8(ABytes, 0, ACount) then
+    Exit(TEncoding.UTF8.GetString(ABytes, 0, ACount));   // the normal case
+  SB := TStringBuilder.Create(ACount);
+  try
+    Start := 0;
+    while Start < ACount do
+    begin
+      I := Start;
+      while (I < ACount) and (ABytes[I] <> 10) do Inc(I);
+      if I < ACount then Len := I - Start + 1 else Len := I - Start;
+      if IsValidUtf8(ABytes, Start, Len) then
+        SB.Append(TEncoding.UTF8.GetString(ABytes, Start, Len))
+      else
+        SB.Append(TEncoding.ANSI.GetString(ABytes, Start, Len));
+      Start := Start + Len;
+    end;
+    Result := SB.ToString;
+  finally
+    SB.Free;
+  end;
+end;
+
 function RunCapture(const ACmdLine, ADir: string; ATimeoutMs: Cardinal;
   out AOutput: string): Boolean;
 var
@@ -672,8 +748,9 @@ begin
 
       if GetTickCount > Deadline then
         TerminateProcess(PI.hProcess, 1);
-      // git speaks UTF-8; decode ONCE over the whole output.
-      AOutput := TEncoding.UTF8.GetString(Raw.Bytes, 0, Raw.Size);
+      // git speaks UTF-8; decode ONCE over the whole output (never per
+      // chunk - that splits multi-byte characters at buffer boundaries).
+      AOutput := DecodeVcsOutput(Raw.Bytes, Raw.Size);
       Result := AOutput <> '';
     finally
       CloseHandle(PI.hThread);
@@ -837,6 +914,21 @@ begin
     if Length(E.Lines) = 0 then Exit;
     ALines := E.Lines;
     Result := True;
+  finally
+    GLock.Leave;
+  end;
+end;
+
+function BlameLoadFailed(const AFile: string): Boolean;
+var
+  E: TBlameEntry;
+begin
+  Result := False;
+  if (GCache = nil) or (AFile = '') then Exit;
+  GLock.Enter;
+  try
+    if GCache.TryGetValue(NormKey(AFile), E) then
+      Result := (not E.Loading) and E.Failed;
   finally
     GLock.Leave;
   end;

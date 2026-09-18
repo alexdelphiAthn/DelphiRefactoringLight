@@ -90,3 +90,7 @@ Packages/Output2/DelphiRefactoringLight370.bpl
 /.mcp.json
 /dih/delinst.err
 /Standalone/RefactoringLightStandalone.res
+
+# MCP bridge build output
+Mcp/Bin/
+Mcp/DCU/

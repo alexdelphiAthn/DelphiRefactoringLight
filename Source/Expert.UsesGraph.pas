@@ -197,8 +197,12 @@ type
     ///  restricted to project units, finds cycle groups and returns a
     ///  result object (nil-safe: always non-nil; Edges empty when no
     ///  cycles). Caller owns the result.</summary>
+    /// <param name="AReader">Optional content source ('' = unreadable).
+    ///  Without it the editor buffers are read (ToolsAPI - MAIN THREAD);
+    ///  with it the analysis runs on any thread (MCP bridge).</param>
     class function Analyze(const AFiles: TArray<string>;
-      const AProgress: TProc<Integer, Integer, string> = nil): TUsesCycleResult;
+      const AProgress: TProc<Integer, Integer, string> = nil;
+      const AReader: TFunc<string, string> = nil): TUsesCycleResult;
   end;
 
 implementation
@@ -1075,7 +1079,8 @@ begin
 end;
 
 class function TUsesGraphAnalyzer.Analyze(const AFiles: TArray<string>;
-  const AProgress: TProc<Integer, Integer, string>): TUsesCycleResult;
+  const AProgress: TProc<Integer, Integer, string>;
+  const AReader: TFunc<string, string>): TUsesCycleResult;
 type
   TRawEdge = record
     FromIdx, ToIdx: Integer;
@@ -1164,7 +1169,12 @@ begin
     begin
       if Assigned(AProgress) then
         AProgress(I + 1, N, R.FFiles[I]);
-      if not ReadFileContent(R.FFiles[I], Content) then Continue;
+      if Assigned(AReader) then
+      begin
+        Content := AReader(R.FFiles[I]);
+        if Content = '' then Continue;
+      end
+      else if not ReadFileContent(R.FFiles[I], Content) then Continue;
       Entries := ParseUsesEntries(Content);
       for J := 0 to High(Entries) do
         if R.FNameToIdx.TryGetValue(UpperCase(Entries[J].UnitName), ToIdx) then

@@ -38,6 +38,7 @@ uses
   Expert.UnitUsageProbe in '..\Source\Expert.UnitUsageProbe.pas',
   Expert.FindUnitDialog in '..\Source\Expert.FindUnitDialog.pas',
   Expert.AutoImport in '..\Source\Expert.AutoImport.pas',
+  Expert.DiagStore in '..\Source\Expert.DiagStore.pas',
   Expert.FindOriginalSymbolWizard in '..\Source\Expert.FindOriginalSymbolWizard.pas',
   Expert.UsesCleanup in '..\Source\Expert.UsesCleanup.pas',
   Expert.RenameDialog in '..\Source\Expert.RenameDialog.pas',
