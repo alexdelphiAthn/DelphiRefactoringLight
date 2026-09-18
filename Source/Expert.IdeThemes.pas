@@ -112,7 +112,11 @@ begin
   begin
     if Service.IDEThemingEnabled then
     begin
+{$IF CompilerVersion >= 37}
       Result := Service.ActiveTheme.Contains('Dark', True);
+{$ELSE}
+      Result := UpperCase(Service.ActiveTheme).Contains('DARK');
+{$IFEND}
     end;
   end;
 end;
